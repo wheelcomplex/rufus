@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Drive access function calls
- * Copyright © 2011-2019 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2020 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -49,6 +49,7 @@
 #define FP_DUPLICATE_METADATA               0x00000008
 #define FP_LARGE_FAT32                      0x00010000
 #define FP_NO_BOOT                          0x00020000
+#define FP_CREATE_PERSISTENCE_CONF          0x00040000
 
 #define FILE_FLOPPY_DISKETTE                0x00000004
 
@@ -292,6 +293,10 @@ interface IVdsAsync {
 #define IVdsServiceLoader_LoadService(This, pwszMachineName, ppService) (This)->lpVtbl->LoadService(This, pwszMachineName, ppService)
 #define IVdsServiceLoader_Release(This) (This)->lpVtbl->Release(This)
 #define IVdsService_QueryProviders(This, masks, ppEnum) (This)->lpVtbl->QueryProviders(This, masks, ppEnum)
+#define IVdsService_WaitForServiceReady(This) ((This)->lpVtbl->WaitForServiceReady(This))
+#define IVdsService_CleanupObsoleteMountPoints(This) ((This)->lpVtbl->CleanupObsoleteMountPoints(This))
+#define IVdsService_Refresh(This) ((This)->lpVtbl->Refresh(This))
+#define IVdsService_Reenumerate(This) ((This)->lpVtbl->Reenumerate(This)) 
 #define IVdsSwProvider_QueryInterface(This, riid, ppvObject) (This)->lpVtbl->QueryInterface(This, riid, ppvObject)
 #define IVdsProvider_Release(This) (This)->lpVtbl->Release(This)
 #define IVdsSwProvider_QueryPacks(This, ppEnum) (This)->lpVtbl->QueryPacks(This, ppEnum)
@@ -345,6 +350,8 @@ typedef struct {
 	MEDIA_TYPE MediaType;
 	int PartitionStyle;
 	int nPartitions;	// number of partitions we actually care about
+	uint64_t PartitionOffset[MAX_PARTITIONS];
+	uint64_t PartitionSize[MAX_PARTITIONS];
 	int FSType;
 	char proposed_label[16];
 	BOOL has_protective_mbr;
@@ -355,22 +362,22 @@ typedef struct {
 	} ClusterSize[FS_MAX];
 } RUFUS_DRIVE_INFO;
 extern RUFUS_DRIVE_INFO SelectedDrive;
-extern uint64_t persistence_size;
-extern DWORD partition_index[3];
+extern uint64_t partition_offset[3];
 
 BOOL SetAutoMount(BOOL enable);
 BOOL GetAutoMount(BOOL* enabled);
 char* GetPhysicalName(DWORD DriveIndex);
-char* GetPartitionName(DWORD DriveIndex, DWORD PartitionIndex);
 BOOL DeletePartitions(DWORD DriveIndex);
 HANDLE GetPhysicalHandle(DWORD DriveIndex, BOOL bLockDrive, BOOL bWriteAccess, BOOL bWriteShare);
-char* GetLogicalName(DWORD DriveIndex, DWORD PartitionIndex, BOOL bKeepTrailingBackslash, BOOL bSilent);
-BOOL WaitForLogical(DWORD DriveIndex, DWORD PartitionIndex);
-HANDLE GetLogicalHandle(DWORD DriveIndex, DWORD PartitionIndex, BOOL bLockDrive, BOOL bWriteAccess, BOOL bWriteShare);
+char* GetLogicalName(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bKeepTrailingBackslash, BOOL bSilent);
+char* AltGetLogicalName(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bKeepTrailingBackslash, BOOL bSilent);
+BOOL WaitForLogical(DWORD DriveIndex, uint64_t PartitionOffset);
+HANDLE GetLogicalHandle(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bLockDrive, BOOL bWriteAccess, BOOL bWriteShare);
 int GetDriveNumber(HANDLE hDrive, char* path);
 BOOL GetDriveLetters(DWORD DriveIndex, char* drive_letters);
 UINT GetDriveTypeFromIndex(DWORD DriveIndex);
 char GetUnusedDriveLetter(void);
+BOOL IsDriveLetterInUse(const char drive_letter);
 BOOL GetDriveLabel(DWORD DriveIndex, char* letter, char** label);
 uint64_t GetDriveSize(DWORD DriveIndex);
 BOOL IsMediaPresent(DWORD DriveIndex);
@@ -379,11 +386,18 @@ BOOL AnalyzePBR(HANDLE hLogicalVolume);
 BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSystemNameSize, BOOL bSilent);
 BOOL UnmountVolume(HANDLE hDrive);
 BOOL MountVolume(char* drive_name, char *drive_guid);
-BOOL AltUnmountVolume(const char* drive_name);
-char* AltMountVolume(DWORD DriveIndex, DWORD PartitionIndex);
+BOOL AltUnmountVolume(const char* drive_name, BOOL bSilent);
+char* AltMountVolume(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bSilent);
 BOOL RemountVolume(char* drive_name);
 BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL mbr_uefi_marker, uint8_t extra_partitions);
 BOOL InitializeDisk(HANDLE hDrive);
 BOOL RefreshDriveLayout(HANDLE hDrive);
-const char* GetPartitionType(BYTE Type);
-const char* GetExtFsLabel(DWORD DriveIndex, DWORD PartitionIndex);
+const char* GetMBRPartitionType(const uint8_t type);
+const char* GetGPTPartitionType(const GUID* guid);
+const char* GetExtFsLabel(DWORD DriveIndex, uint64_t PartitionOffset);
+BOOL GetDevices(DWORD devnum);
+BOOL CyclePort(int index);
+int CycleDevice(int index);
+BOOL RefreshLayout(DWORD DriveIndex);
+BOOL GetOpticalMedia(IMG_SAVE* img_save);
+BOOL ToggleEsp(DWORD DriveIndex);

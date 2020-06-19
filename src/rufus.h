@@ -1,6 +1,6 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
- * Copyright © 2011-2019 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2020 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -71,6 +71,8 @@
 #define MAX_REFRESH                 25			// How long we should wait to refresh UI elements (in ms)
 #define MAX_GUID_STRING_LENGTH      40
 #define MAX_PARTITIONS              16			// Maximum number of partitions we handle
+#define MAX_ESP_TOGGLE              8			// Maximum number of entries we record to toggle GPT ESP back and forth
+#define MAX_ISO_TO_ESP_SIZE         512			// Maximum size we allow for the ISO → ESP option (in MB)
 #define MAX_SECTORS_TO_CLEAR        128			// nb sectors to zap when clearing the MBR/GPT (must be >34)
 #define MAX_WININST                 4			// Max number of install[.wim|.esd] we can handle on an image
 #define MBR_UEFI_MARKER             0x49464555	// 'U', 'E', 'F', 'I', as a 32 bit little endian longword
@@ -111,6 +113,8 @@
 #define WPPRECORDER_MORE_INFO_URL   "https://github.com/pbatard/rufus/wiki/FAQ#BSODs_with_Windows_To_Go_drives_created_from_Windows_10_1809_ISOs"
 #define SEVENZIP_URL                "https://www.7-zip.org"
 #define FILES_DIR                   "rufus_files"
+#define DEFAULT_ESP_MOUNT_POINT     "S:\\"
+#define IS_POWER_OF_2(x)            ((x != 0) && (((x) & ((x) - 1)) == 0))
 #define IGNORE_RETVAL(expr)         do { (void)(expr); } while(0)
 #ifndef ARRAYSIZE
 #define ARRAYSIZE(A)                (sizeof(A)/sizeof((A)[0]))
@@ -224,14 +228,17 @@ enum timer_type {
 
 /* Action type, for progress bar breakdown */
 enum action_type {
-	OP_ANALYZE_MBR,
+	OP_NOOP_WITH_TASKBAR = -3,
+	OP_NOOP = -2,
+	OP_INIT = -1,
+	OP_ANALYZE_MBR = 0,
 	OP_BADBLOCKS,
 	OP_ZERO_MBR,
 	OP_PARTITION,
 	OP_FORMAT,
 	OP_CREATE_FS,
 	OP_FIX_MBR,
-	OP_DOS,
+	OP_FILE_COPY,
 	OP_FINALIZE,
 	OP_MAX
 };
@@ -297,17 +304,21 @@ enum checksum_type {
 #define HAS_BOOTMGR_BIOS(r) (r.has_bootmgr)
 #define HAS_BOOTMGR_EFI(r)  (r.has_bootmgr_efi)
 #define HAS_BOOTMGR(r)      (HAS_BOOTMGR_BIOS(r) || HAS_BOOTMGR_EFI(r))
+#define HAS_REGULAR_EFI(r)  (r.has_efi & 0x7E)
 #define HAS_WININST(r)      (r.wininst_index != 0)
 #define HAS_WINPE(r)        (((r.winpe & WINPE_I386) == WINPE_I386)||((r.winpe & WINPE_AMD64) == WINPE_AMD64)||((r.winpe & WINPE_MININT) == WINPE_MININT))
 #define HAS_WINDOWS(r)      (HAS_BOOTMGR(r) || (r.uses_minint) || HAS_WINPE(r))
 #define HAS_WIN7_EFI(r)     ((r.has_efi == 1) && HAS_WININST(r))
 #define HAS_EFI_IMG(r)      (r.efi_img_path[0] != 0)
 #define IS_DD_BOOTABLE(r)   (r.is_bootable_img)
+#define IS_DD_ONLY(r)       (r.is_bootable_img && (!r.is_iso || r.disable_iso))
 #define IS_EFI_BOOTABLE(r)  (r.has_efi != 0)
 #define IS_BIOS_BOOTABLE(r) (HAS_BOOTMGR(r) || HAS_SYSLINUX(r) || HAS_WINPE(r) || HAS_GRUB(r) || HAS_REACTOS(r) || HAS_KOLIBRIOS(r))
 #define HAS_WINTOGO(r)      (HAS_BOOTMGR(r) && IS_EFI_BOOTABLE(r) && HAS_WININST(r))
 #define HAS_PERSISTENCE(r)  ((HAS_SYSLINUX(r) || HAS_GRUB(r)) && !(HAS_WINDOWS(r) || HAS_REACTOS(r) || HAS_KOLIBRIOS(r)))
 #define IS_FAT(fs)          ((fs_type == FS_FAT16) || (fs_type == FS_FAT32))
+#define SYMLINKS_RR         0x01
+#define SYMLINKS_UDF        0x02
 
 typedef struct {
 	char label[192];					// 3*64 to account for UTF-8
@@ -317,17 +328,22 @@ typedef struct {
 	char wininst_path[MAX_WININST][64];	// path to the Windows install image(s)
 	char efi_img_path[128];				// path to an efi.img file
 	uint64_t image_size;
+	uint64_t archive_size;
 	uint64_t projected_size;
 	int64_t mismatch_size;
 	uint32_t wininst_version;
 	BOOLEAN is_iso;
 	BOOLEAN is_bootable_img;
+	BOOLEAN is_vhd;
+	BOOLEAN disable_iso;
 	uint16_t winpe;
 	uint8_t has_efi;
+	uint8_t has_md5sum;
 	uint8_t wininst_index;
+	uint8_t has_symlinks;
 	BOOLEAN has_4GB_file;
 	BOOLEAN has_long_filename;
-	BOOLEAN has_symlinks;
+	BOOLEAN has_deep_directories;
 	BOOLEAN has_bootmgr;
 	BOOLEAN has_bootmgr_efi;
 	BOOLEAN has_autorun;
@@ -338,9 +354,9 @@ typedef struct {
 	BOOLEAN has_grub4dos;
 	BOOLEAN has_grub2;
 	BOOLEAN has_kolibrios;
+	BOOLEAN uses_casper;
 	BOOLEAN uses_minint;
 	BOOLEAN compression_type;
-	BOOLEAN is_vhd;
 	uint16_t sl_version;	// Syslinux/Isolinux version
 	char sl_version_str[12];
 	char sl_version_ext[32];
@@ -439,11 +455,12 @@ extern HWND hPartitionScheme, hTargetSystem, hFileSystem, hClusterSize, hLabel, 
 extern HWND hInfo, hProgress, hDiskID;
 extern WORD selected_langid;
 extern DWORD FormatStatus, DownloadStatus, MainThreadId, LastWriteError;
-extern BOOL use_own_c32[NB_OLD_C32], detect_fakes, iso_op_in_progress, format_op_in_progress, right_to_left_mode;
+extern BOOL use_own_c32[NB_OLD_C32], detect_fakes, op_in_progress, right_to_left_mode;
 extern BOOL allow_dual_uefi_bios, large_drive, usb_debug;
 extern int64_t iso_blocking_status;
 extern uint8_t image_options;
 extern uint16_t rufus_version[3], embedded_sl_version[2];
+extern uint64_t persistence_size;
 extern size_t ubuffer_pos;
 extern const int nb_steps[FS_MAX];
 extern float fScale;
@@ -469,8 +486,11 @@ extern void PrintStatusInfo(BOOL info, BOOL debug, unsigned int duration, int ms
 #define PrintInfo(...) PrintStatusInfo(TRUE, FALSE, __VA_ARGS__)
 #define PrintInfoDebug(...) PrintStatusInfo(TRUE, TRUE, __VA_ARGS__)
 extern void UpdateProgress(int op, float percent);
+extern void UpdateProgressWithInfo(int op, int msg, uint64_t processed, uint64_t total);
+#define UpdateProgressWithInfoInit(hProgressDialog, bNoAltMode) UpdateProgressWithInfo(OP_INIT, (int)bNoAltMode, (uint64_t)(uintptr_t)hProgressDialog, 0);
 extern const char* StrError(DWORD error_code, BOOL use_default_locale);
 extern char* GuidToString(const GUID* guid);
+extern GUID* StringToGuid(const char* str);
 extern char* SizeToHumanReadable(uint64_t size, BOOL copy_to_log, BOOL fake_units);
 extern char* TimestampToHumanReadable(uint64_t ts);
 extern HWND MyCreateDialog(HINSTANCE hInstance, int Dialog_ID, HWND hWndParent, DLGPROC lpDialogFunc);
@@ -502,7 +522,6 @@ extern char* MountISO(const char* path);
 extern void UnMountISO(void);
 extern BOOL InstallSyslinux(DWORD drive_index, char drive_letter, int fs);
 extern uint16_t GetSyslinuxVersion(char* buf, size_t buf_size, char** ext);
-extern BOOL CreateProgress(void);
 extern BOOL SetAutorun(const char* path);
 extern char* FileDialog(BOOL save, char* path, const ext_t* ext, DWORD options);
 extern BOOL FileIO(BOOL save, char* path, char** buffer, DWORD* size);
@@ -510,9 +529,6 @@ extern unsigned char* GetResource(HMODULE module, char* name, char* type, const 
 extern DWORD GetResourceSize(HMODULE module, char* name, char* type, const char* desc);
 extern DWORD RunCommand(const char* cmdline, const char* dir, BOOL log);
 extern BOOL CompareGUID(const GUID *guid1, const GUID *guid2);
-extern BOOL GetDevices(DWORD devnum);
-extern BOOL ResetDevice(int index);
-extern BOOL GetOpticalMedia(IMG_SAVE* img_save);
 extern BOOL SetLGP(BOOL bRestore, BOOL* bExistingKey, const char* szPath, const char* szPolicy, DWORD dwValue);
 extern LONG GetEntryWidth(HWND hDropDown, const char* entry);
 extern uint64_t DownloadToFileOrBuffer(const char* url, const char* file, BYTE** buffer, HWND hProgressDialog, BOOL bTaskBarProgress);
@@ -524,8 +540,9 @@ extern BOOL CheckForUpdates(BOOL force);
 extern void DownloadNewVersion(void);
 extern BOOL DownloadISO(void);
 extern BOOL IsDownloadable(const char* url);
-extern const char* ResolveRedirect(const char* url);
 extern BOOL IsShown(HWND hDlg);
+extern uint32_t read_file(const char* path, uint8_t** buf);
+extern uint32_t write_file(const char* path, const uint8_t* buf, const uint32_t size);
 extern char* get_token_data_file_indexed(const char* token, const char* filename, int index);
 #define get_token_data_file(token, filename) get_token_data_file_indexed(token, filename, 1)
 extern char* set_token_data_file(const char* token, const char* data, const char* filename);
@@ -570,6 +587,9 @@ extern BOOL EnablePrivileges(void);
 extern void FlashTaskbar(HANDLE handle);
 extern DWORD WaitForSingleObjectWithMessages(HANDLE hHandle, DWORD dwMilliseconds);
 extern HICON CreateMirroredIcon(HICON hiconOrg);
+extern HANDLE CreatePreallocatedFile(const char* lpFileName, DWORD dwDesiredAccess,
+	DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+	DWORD dwFlagsAndAttributes, LONGLONG fileSize);
 #define GetTextWidth(hDlg, id) GetTextSize(GetDlgItem(hDlg, id), NULL).cx
 
 DWORD WINAPI FormatThread(void* param);
@@ -642,10 +662,12 @@ static __inline HMODULE GetLibraryHandle(char* szLibraryName) {
 #define PF_INIT_OR_OUT(proc, name)			do {PF_INIT(proc, name);         \
 	if (pf##proc == NULL) {uprintf("Unable to locate %s() in %s.dll: %s\n",  \
 	#proc, #name, WindowsErrorString()); goto out;} } while(0)
+#define PF_INIT_OR_SET_STATUS(proc, name)	do {PF_INIT(proc, name);         \
+	if ((pf##proc == NULL) && (NT_SUCCESS(status))) status = STATUS_NOT_IMPLEMENTED; } while(0)
 
 /* Custom application errors */
-#define FAC(f)                         (f<<16)
-#define APPERR(err)                    (APPLICATION_ERROR_MASK|err)
+#define FAC(f)                         ((f)<<16)
+#define APPERR(err)                    (APPLICATION_ERROR_MASK|(err))
 #define ERROR_INCOMPATIBLE_FS          0x1201
 #define ERROR_CANT_QUICK_FORMAT        0x1202
 #define ERROR_INVALID_CLUSTER_SIZE     0x1203
@@ -659,3 +681,4 @@ static __inline HMODULE GetLibraryHandle(char* szLibraryName) {
 #define ERROR_CANT_ASSIGN_LETTER       0x120B
 #define ERROR_CANT_MOUNT_VOLUME        0x120C
 #define ERROR_BAD_SIGNATURE            0x120D
+#define ERROR_CANT_DOWNLOAD            0x120E

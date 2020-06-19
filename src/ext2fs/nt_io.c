@@ -63,6 +63,9 @@ typedef struct _NT_PRIVATE_DATA {
     ULONG   buffer_size;
     BOOLEAN read_only;
     BOOLEAN written;
+    // Used by Rufus
+    __u64   offset;
+    __u64   size;
 } NT_PRIVATE_DATA, *PNT_PRIVATE_DATA;
 
 //
@@ -73,7 +76,9 @@ static errcode_t nt_open(const char *name, int flags, io_channel *channel);
 static errcode_t nt_close(io_channel channel);
 static errcode_t nt_set_blksize(io_channel channel, int blksize);
 static errcode_t nt_read_blk(io_channel channel, unsigned long block, int count, void *data);
+static errcode_t nt_read_blk64(io_channel channel, unsigned long long block, int count, void* data);
 static errcode_t nt_write_blk(io_channel channel, unsigned long block, int count, const void *data);
+static errcode_t nt_write_blk64(io_channel channel, unsigned long long block, int count, const void* data);
 static errcode_t nt_flush(io_channel channel);
 
 static struct struct_io_manager struct_nt_manager = {
@@ -83,7 +88,9 @@ static struct struct_io_manager struct_nt_manager = {
 	.close		= nt_close,
 	.set_blksize	= nt_set_blksize,
 	.read_blk	= nt_read_blk,
+	.read_blk64	= nt_read_blk64,
 	.write_blk	= nt_write_blk,
+	.write_blk64	= nt_write_blk64,
 	.flush		= nt_flush
 };
 
@@ -199,7 +206,7 @@ static NTSTATUS _OpenNtName(IN PCSTR Name, IN BOOLEAN Readonly, OUT PHANDLE Hand
 	UnicodeString.MaximumLength = sizeof(Buffer); // in bytes!!!
 
 	// Initialize object
-	InitializeObjectAttributes(&ObjectAttributes, &UnicodeString, OBJ_CASE_INSENSITIVE, NULL, NULL );
+	InitializeObjectAttributes(&ObjectAttributes, &UnicodeString, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
 	// Try to open it in initial mode
 	if (ARGUMENT_PRESENT(OpenedReadonly))
@@ -273,11 +280,9 @@ static __inline NTSTATUS _DismountDrive(IN HANDLE Handle)
 static __inline BOOLEAN _IsMounted(IN HANDLE Handle)
 {
 	IO_STATUS_BLOCK IoStatusBlock;
-	NTSTATUS Status = STATUS_DLL_NOT_FOUND;
 	PF_INIT(NtFsControlFile, NtDll);
-	if (pfNtFsControlFile != NULL)
-		pfNtFsControlFile(Handle, 0, 0, 0, &IoStatusBlock, FSCTL_IS_VOLUME_MOUNTED, 0, 0, 0, 0);
-	return (BOOLEAN)(Status == STATUS_SUCCESS);
+	return (pfNtFsControlFile == NULL) ? STATUS_DLL_NOT_FOUND :
+		(BOOLEAN)(pfNtFsControlFile(Handle, 0, 0, 0, &IoStatusBlock, FSCTL_IS_VOLUME_MOUNTED, 0, 0, 0, 0) == STATUS_SUCCESS);
 }
 
 static __inline NTSTATUS _CloseDisk(IN HANDLE Handle)
@@ -286,13 +291,17 @@ static __inline NTSTATUS _CloseDisk(IN HANDLE Handle)
 	return (pfNtClose == NULL) ? STATUS_DLL_NOT_FOUND : pfNtClose(Handle);
 }
 
-static PCSTR _NormalizeDeviceName(IN PCSTR Device, IN PSTR NormalizedDeviceNameBuffer)
+static PCSTR _NormalizeDeviceName(IN PCSTR Device, IN PSTR NormalizedDeviceNameBuffer, OUT __u64 *Offset, OUT __u64 *Size)
 {
+	*Offset = *Size = 0ULL;
 	// Convert non NT paths to NT
 	if (Device[0] == '\\') {
 		if ((strlen(Device) < 4) || (Device[3] != '\\'))
 			return Device;
-		strcpy(NormalizedDeviceNameBuffer, Device);
+		// Handle custom paths of the form "<Physical> <Offset> <Size>" used by Rufus to
+		// enable multi-partition access on removable devices, for pre 1703 platforms.
+		if (sscanf(Device, "%s %I64u %I64u", NormalizedDeviceNameBuffer, Offset, Size) < 1)
+			return NULL;
 		if ((NormalizedDeviceNameBuffer[1] == '\\') || (NormalizedDeviceNameBuffer[1] == '.'))
 			NormalizedDeviceNameBuffer[1] = '?';
 		if (NormalizedDeviceNameBuffer[2] == '.')
@@ -341,7 +350,8 @@ static VOID _GetDeviceSize(IN HANDLE h, OUT unsigned __int64 *FsSize)
 	}
 }
 
-static BOOLEAN _Ext2OpenDevice(IN PCSTR Name, IN BOOLEAN ReadOnly, OUT PHANDLE Handle, OUT PBOOLEAN OpenedReadonly OPTIONAL, OUT errcode_t *Errno OPTIONAL)
+static BOOLEAN _Ext2OpenDevice(IN PCSTR Name, IN BOOLEAN ReadOnly, OUT PHANDLE Handle,
+	OUT __u64 *Offset, OUT __u64 *Size, OUT PBOOLEAN OpenedReadonly OPTIONAL, OUT errcode_t *Errno OPTIONAL)
 {
 	CHAR NormalizedDeviceName[512];
 	NTSTATUS Status;
@@ -358,7 +368,7 @@ static BOOLEAN _Ext2OpenDevice(IN PCSTR Name, IN BOOLEAN ReadOnly, OUT PHANDLE H
 		(':' == *(Name + 1)) && ('\0' == *(Name + 2))) {
 		Status = _OpenDriveLetter(*Name, ReadOnly, Handle, OpenedReadonly);
 	} else {
-		Name = _NormalizeDeviceName(Name, NormalizedDeviceName);
+		Name = _NormalizeDeviceName(Name, NormalizedDeviceName, Offset, Size);
 		if (Name == NULL) {
 			LastWinError = ERROR_INVALID_PARAMETER;
 			if (ARGUMENT_PRESENT(Errno))
@@ -438,12 +448,13 @@ static BOOLEAN _SetPartType(IN HANDLE Handle, IN UCHAR Type)
 errcode_t ext2fs_check_if_mounted(const char *file, int *mount_flags)
 {
 	errcode_t errcode = 0;
+	__u64 Offset, Size;
 	HANDLE h;
 	BOOLEAN Readonly;
 
 	*mount_flags = 0;
 
-	if (!_Ext2OpenDevice(file, TRUE, &h, &Readonly, &errcode))
+	if (!_Ext2OpenDevice(file, TRUE, &h, &Offset, &Size, &Readonly, &errcode))
 		return errcode;
 
 	*mount_flags &= _IsMounted(h) ? EXT2_MF_MOUNTED : 0;
@@ -463,18 +474,19 @@ errcode_t ext2fs_check_mount_point(const char *file, int *mount_flags, char *mtp
 // different removable devices (e.g. UFD) may be remounted under the same path.
 errcode_t ext2fs_get_device_size2(const char *file, int blocksize, blk64_t *retblocks)
 {
-	errcode_t errcode;
-	__int64 fs_size = 0;
+	errcode_t errcode = 0;
+	__u64 Offset, Size = 0;
 	HANDLE h;
 	BOOLEAN Readonly;
 
-	if (!_Ext2OpenDevice(file, TRUE, &h, &Readonly, &errcode))
+	if (!_Ext2OpenDevice(file, TRUE, &h, &Offset, &Size, &Readonly, &errcode))
 		return errcode;
 
-	_GetDeviceSize(h, &fs_size);
+	if (Size == 0LL)
+		_GetDeviceSize(h, &Size);
 	_CloseDisk(h);
 
-	*retblocks = (blk64_t)(fs_size / blocksize);
+	*retblocks = (blk64_t)(Size / blocksize);
 	return 0;
 }
 
@@ -529,7 +541,8 @@ static errcode_t nt_open(const char *name, int flags, io_channel *channel)
 	io->private_data = nt_data;
 
 	// Open the device
-	if (!_Ext2OpenDevice(name, (BOOLEAN)!BooleanFlagOn(flags, EXT2_FLAG_RW), &nt_data->handle, &nt_data->read_only, &errcode)) {
+	if (!_Ext2OpenDevice(name, (BOOLEAN)!BooleanFlagOn(flags, EXT2_FLAG_RW), &nt_data->handle,
+		&nt_data->offset, &nt_data->size, &nt_data->read_only, &errcode)) {
 		if (!errcode)
 			errcode = EIO;
 		goto out;
@@ -609,7 +622,7 @@ static errcode_t nt_set_blksize(io_channel channel, int blksize)
 	return 0;
 }
 
-static errcode_t nt_read_blk(io_channel channel, unsigned long block, int count, void *buf)
+static errcode_t nt_read_blk64(io_channel channel, unsigned long long block, int count, void *buf)
 {
 	PVOID read_buffer;
 	ULONG read_size;
@@ -631,7 +644,7 @@ static errcode_t nt_read_blk(io_channel channel, unsigned long block, int count,
 
 	size = (count < 0) ? (ULONG)(-count) : (ULONG)(count * channel->block_size);
 
-	offset.QuadPart = block * channel->block_size;
+	offset.QuadPart = block * channel->block_size + nt_data->offset;
 
 	// If not fit to the block
 	if (size <= nt_data->buffer_size) {
@@ -660,7 +673,12 @@ static errcode_t nt_read_blk(io_channel channel, unsigned long block, int count,
 	return 0;
 }
 
-static errcode_t nt_write_blk(io_channel channel, unsigned long block, int count, const void *buf)
+static errcode_t nt_read_blk(io_channel channel, unsigned long block, int count, void* buf)
+{
+	return nt_read_blk64(channel, block, count, buf);
+}
+
+static errcode_t nt_write_blk64(io_channel channel, unsigned long long block, int count, const void *buf)
 {
 	ULONG write_size;
 	LARGE_INTEGER offset;
@@ -686,7 +704,7 @@ static errcode_t nt_write_blk(io_channel channel, unsigned long block, int count
 
 
 	assert((write_size % 512) == 0);
-	offset.QuadPart = block * channel->block_size;
+	offset.QuadPart = block * channel->block_size + nt_data->offset;
 
 	if (!_RawWrite(nt_data->handle, offset, write_size, buf, &errcode)) {
 		if (channel->write_error)
@@ -705,6 +723,11 @@ static errcode_t nt_write_blk(io_channel channel, unsigned long block, int count
 	nt_data->written = TRUE;
 
 	return 0;
+}
+
+static errcode_t nt_write_blk(io_channel channel, unsigned long block, int count, const void* buf)
+{
+	return nt_write_blk64(channel, block, count, buf);
 }
 
 static errcode_t nt_flush(io_channel channel)

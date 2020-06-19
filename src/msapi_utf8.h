@@ -3,7 +3,7 @@
  * Compensating for what Microsoft should have done a long long time ago.
  * Also see https://utf8everywhere.org
  *
- * Copyright © 2010-2019 Pete Batard <pete@akeo.ie>
+ * Copyright © 2010-2020 Pete Batard <pete@akeo.ie>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -29,6 +29,7 @@
 #include <setupapi.h>
 #include <direct.h>
 #include <share.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <io.h>
 #include <sys/types.h>
@@ -87,7 +88,7 @@ static __inline char* wchar_to_utf8(const wchar_t* wstr)
 
 	// Convert the empty string too
 	if (wstr[0] == 0)
-		return calloc(1, 1);
+		return (char*)calloc(1, 1);
 
 	// Find out the size we need to allocate for our converted string
 	size = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
@@ -119,7 +120,7 @@ static __inline wchar_t* utf8_to_wchar(const char* str)
 
 	// Convert the empty string too
 	if (str[0] == 0)
-		return calloc(1, sizeof(wchar_t));
+		return (wchar_t*)calloc(1, sizeof(wchar_t));
 
 	// Find out the size we need to allocate for our converted string
 	size = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
@@ -329,10 +330,14 @@ static __inline int GetWindowTextU(HWND hWnd, char* lpString, int nMaxCount)
 {
 	int ret = 0;
 	DWORD err = ERROR_INVALID_DATA;
+	// Handle the empty string as GetWindowTextW() returns 0 then
+	if ((lpString != NULL) && (nMaxCount > 0))
+		lpString[0] = 0;
 	// coverity[returned_null]
 	walloc(lpString, nMaxCount);
 	ret = GetWindowTextW(hWnd, wlpString, nMaxCount);
 	err = GetLastError();
+	// coverity[var_deref_model]
 	if ( (ret != 0) && ((ret = wchar_to_utf8_no_alloc(wlpString, lpString, nMaxCount)) == 0) ) {
 		err = GetLastError();
 	}
@@ -363,7 +368,7 @@ static __inline int GetWindowTextLengthU(HWND hWnd)
 	ret = GetWindowTextLengthW(hWnd);
 	err = GetLastError();
 	if (ret == 0) goto out;
-	wbuf = calloc(ret, sizeof(wchar_t));
+	wbuf = (wchar_t* )calloc(ret, sizeof(wchar_t));
 	err = GetLastError();
 	if (wbuf == NULL) {
 		err = ERROR_OUTOFMEMORY; ret = 0; goto out;
@@ -435,7 +440,7 @@ static __inline int ComboBox_GetLBTextU(HWND hCtrl, int index, char* lpString)
 	size = (int)SendMessageW(hCtrl, CB_GETLBTEXTLEN, (WPARAM)index, (LPARAM)0);
 	if (size < 0)
 		return size;
-	wlpString = (wchar_t*)calloc(size+1, sizeof(wchar_t));
+	wlpString = (wchar_t*)calloc((size_t)size + 1, sizeof(wchar_t));
 	size = (int)SendMessageW(hCtrl, CB_GETLBTEXT, (WPARAM)index, (LPARAM)wlpString);
 	err = GetLastError();
 	if (size > 0)
@@ -448,7 +453,7 @@ static __inline int ComboBox_GetLBTextU(HWND hCtrl, int index, char* lpString)
 static __inline DWORD CharUpperBuffU(char* lpString, DWORD len)
 {
 	DWORD ret;
-	wchar_t *wlpString = calloc(len, sizeof(wchar_t));
+	wchar_t *wlpString = (wchar_t*)calloc(len, sizeof(wchar_t));
 	if (wlpString == NULL)
 		return 0;
 	utf8_to_wchar_no_alloc(lpString, wlpString, len);
@@ -874,10 +879,10 @@ static __inline BOOL WINAPI GetOpenSaveFileNameU(LPOPENFILENAMEA lpofn, BOOL sav
 	}
 	wofn.nMaxCustFilter = lpofn->nMaxCustFilter;
 	wofn.nFilterIndex = lpofn->nFilterIndex;
-	wofn.lpstrFile = calloc(lpofn->nMaxFile, sizeof(wchar_t));
+	wofn.lpstrFile = (LPWSTR)calloc(lpofn->nMaxFile, sizeof(wchar_t));
 	utf8_to_wchar_no_alloc(lpofn->lpstrFile, wofn.lpstrFile, lpofn->nMaxFile);
 	wofn.nMaxFile = lpofn->nMaxFile;
-	wofn.lpstrFileTitle = calloc(lpofn->nMaxFileTitle, sizeof(wchar_t));
+	wofn.lpstrFileTitle = (LPWSTR)calloc(lpofn->nMaxFileTitle, sizeof(wchar_t));
 	utf8_to_wchar_no_alloc(lpofn->lpstrFileTitle, wofn.lpstrFileTitle, lpofn->nMaxFileTitle);
 	wofn.nMaxFileTitle = lpofn->nMaxFileTitle;
 	wofn.lpstrInitialDir = utf8_to_wchar(lpofn->lpstrInitialDir);
@@ -1020,6 +1025,15 @@ static __inline int _openU(const char *filename, int oflag , int pmode)
 }
 #endif
 
+static __inline int _unlinkU(const char* path)
+{
+	int ret;
+	wconvert(path);
+	ret = _wunlink(wpath);
+	wfree(path);
+	return ret;
+}
+
 static __inline int _stat64U(const char *path, struct __stat64 *buffer)
 {
 	int ret;
@@ -1027,6 +1041,26 @@ static __inline int _stat64U(const char *path, struct __stat64 *buffer)
 	ret = _wstat64(wpath, buffer);
 	wfree(path);
 	return ret;
+}
+
+static __inline int _accessU(const char* path, int mode)
+{
+	int ret;
+	wconvert(path);
+	ret = _waccess(wpath, mode);
+	wfree(path);
+	return ret;
+}
+
+static __inline const char* _filenameU(const char* path)
+{
+	int i;
+	if (path == NULL)
+		return NULL;
+	for (i = (int)strlen(path) - 1; i >= 0; i--)
+		if ((path[i] == '/') || (path[i] == '\\'))
+			return &path[i + 1];
+	return path;
 }
 
 // returned UTF-8 string must be freed
@@ -1037,7 +1071,7 @@ static __inline char* getenvU(const char* varname)
 	wchar_t* wbuf = NULL;
 	// _wgetenv() is *BROKEN* in MS compilers => use GetEnvironmentVariableW()
 	DWORD dwSize = GetEnvironmentVariableW(wvarname, wbuf, 0);
-	wbuf = calloc(dwSize, sizeof(wchar_t));
+	wbuf = (wchar_t*)calloc(dwSize, sizeof(wchar_t));
 	if (wbuf == NULL) {
 		wfree(varname);
 		return NULL;
@@ -1055,6 +1089,43 @@ static __inline int _mkdirU(const char* dirname)
 	wconvert(dirname);
 	int ret;
 	ret = _wmkdir(wdirname);
+	wfree(dirname);
+	return ret;
+}
+
+// This version of _mkdirU creates all needed directories along the way
+static __inline int _mkdirExU(const char* dirname)
+{
+	int ret = -1, trailing_slash = -1;
+	size_t i, len;
+	wconvert(dirname);
+	len = wcslen(wdirname);
+	while (trailing_slash && (len > 0)) {
+		if ((wdirname[len - 1] == '\\') || (wdirname[len - 1] == '/'))
+			wdirname[--len] = 0;
+		else
+			trailing_slash = 0;
+	}
+	for (i = 0; i < len; i++)
+		if ((wdirname[i] == '\\') || (wdirname[i] == '/'))
+			wdirname[i] = 0;
+	for (i = 0; i < len; ) {
+		if ((_wmkdir(wdirname) < 0) && (errno != EEXIST) && (errno != EACCES))
+			goto out;
+		i = wcslen(wdirname);
+		wdirname[i] = '\\';
+	}
+	ret = 0;
+out:
+	wfree(dirname);
+	return ret;
+}
+
+static __inline int _rmdirU(const char* dirname)
+{
+	wconvert(dirname);
+	int ret;
+	ret = _wrmdir(wdirname);
 	wfree(dirname);
 	return ret;
 }

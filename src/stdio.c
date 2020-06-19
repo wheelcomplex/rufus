@@ -1,7 +1,8 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Standard User I/O Routines (logging, status, error, etc.)
- * Copyright © 2011-2019 Pete Batard <pete@akeo.ie>
+ * Copyright © 2020 Mattiwatti <mattiwatti@gmail.com>
+ * Copyright © 2011-2020 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <winternl.h>
 #include <assert.h>
 #include <ctype.h>
 #include <math.h>
@@ -89,6 +91,53 @@ void _uprintfs(const char* str)
 		Edit_Scroll(hLog, Edit_GetLineCount(hLog), 0);
 	}
 	free(wstr);
+}
+
+uint32_t read_file(const char* path, uint8_t** buf)
+{
+	FILE* fd = fopenU(path, "rb");
+	if (fd == NULL) {
+		uprintf("Error: Can't open file '%s'", path);
+		return 0;
+	}
+
+	fseek(fd, 0L, SEEK_END);
+	uint32_t size = (uint32_t)ftell(fd);
+	fseek(fd, 0L, SEEK_SET);
+
+	*buf = malloc(size);
+	if (*buf == NULL) {
+		uprintf("Error: Can't allocate %d bytes buffer for file '%s'", size, path);
+		size = 0;
+		goto out;
+	}
+	if (fread(*buf, 1, size, fd) != size) {
+		uprintf("Error: Can't read '%s'", path);
+		size = 0;
+	}
+
+out:
+	fclose(fd);
+	if (size == 0) {
+		free(*buf);
+		*buf = NULL;
+	}
+	return size;
+}
+
+uint32_t write_file(const char* path, const uint8_t* buf, const uint32_t size)
+{
+	uint32_t written;
+	FILE* fd = fopenU(path, "wb");
+	if (fd == NULL) {
+		uprintf("Error: Can't create '%s'", path);
+		return 0;
+	}
+	written = (uint32_t)fwrite(buf, 1, size, fd);
+	if (written != size)
+		uprintf("Error: Can't write '%s'", path);
+	fclose(fd);
+	return written;
 }
 
 // Prints a bitstring of a number of any size, with or without leading zeroes.
@@ -596,9 +645,9 @@ const char *WindowsErrorString(void)
 	static_sprintf(err_string, "[0x%08lX] ", error_code);
 	presize = (DWORD)strlen(err_string);
 
-	size = FormatMessageU(FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS, NULL, HRESULT_CODE(error_code),
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), &err_string[presize],
-		sizeof(err_string)-(DWORD)strlen(err_string), NULL);
+	size = FormatMessageU(FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+		HRESULT_CODE(error_code), MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
+		&err_string[presize], sizeof(err_string)-(DWORD)strlen(err_string), NULL);
 	if (size == 0) {
 		format_error = GetLastError();
 		if ((format_error) && (format_error != 0x13D))		// 0x13D, decode error, is returned for unknown codes
@@ -625,10 +674,24 @@ char* GuidToString(const GUID* guid)
 
 	if (guid == NULL) return NULL;
 	sprintf(guid_string, "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
-		(unsigned int)guid->Data1, guid->Data2, guid->Data3,
+		(uint32_t)guid->Data1, guid->Data2, guid->Data3,
 		guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3],
 		guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
 	return guid_string;
+}
+
+GUID* StringToGuid(const char* str)
+{
+	static GUID guid;
+
+	if (str == NULL) return NULL;
+	if (sscanf(str, "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		(uint32_t*)&guid.Data1, (uint32_t*)&guid.Data2, (uint32_t*)&guid.Data3,
+		(uint32_t*)&guid.Data4[0], (uint32_t*)&guid.Data4[1], (uint32_t*)&guid.Data4[2],
+		(uint32_t*)&guid.Data4[3], (uint32_t*)&guid.Data4[4], (uint32_t*)&guid.Data4[5],
+		(uint32_t*)&guid.Data4[6], (uint32_t*)&guid.Data4[7]) != 11)
+		return NULL;
+	return &guid;
 }
 
 // Find upper power of 2
@@ -766,6 +829,8 @@ const char* _StrError(DWORD error_code)
 		return lmprintf(MSG_079);
 	case ERROR_BAD_SIGNATURE:
 		return lmprintf(MSG_172);
+	case ERROR_CANT_DOWNLOAD:
+		return lmprintf(MSG_242);
 	default:
 		SetLastError(error_code);
 		return WindowsErrorString();
@@ -866,4 +931,136 @@ DWORD WaitForSingleObjectWithMessages(HANDLE hHandle, DWORD dwMilliseconds)
 	} while (res == (WAIT_OBJECT_0 + 1));
 
 	return res;
+}
+
+#define STATUS_SUCCESS					((NTSTATUS)0x00000000L)
+#define STATUS_NOT_IMPLEMENTED			((NTSTATUS)0xC0000002L)
+#define FILE_ATTRIBUTE_VALID_FLAGS		0x00007FB7
+#define NtCurrentPeb()					(NtCurrentTeb()->ProcessEnvironmentBlock)
+#define RtlGetProcessHeap()				(NtCurrentPeb()->Reserved4[1]) // NtCurrentPeb()->ProcessHeap, mangled due to deficiencies in winternl.h
+
+PF_TYPE_DECL(NTAPI, NTSTATUS, NtCreateFile, (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG));
+PF_TYPE_DECL(NTAPI, BOOLEAN, RtlDosPathNameToNtPathNameW, (PCWSTR, PUNICODE_STRING, PWSTR*, PVOID));
+PF_TYPE_DECL(NTAPI, BOOLEAN, RtlFreeHeap, (PVOID, ULONG, PVOID));
+PF_TYPE_DECL(NTAPI, VOID, RtlSetLastWin32ErrorAndNtStatusFromNtStatus, (NTSTATUS));
+
+HANDLE CreatePreallocatedFile(const char* lpFileName, DWORD dwDesiredAccess,
+	DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+	DWORD dwFlagsAndAttributes, LONGLONG fileSize)
+{
+	HANDLE fileHandle = INVALID_HANDLE_VALUE;
+	OBJECT_ATTRIBUTES objectAttributes;
+	IO_STATUS_BLOCK ioStatusBlock;
+	UNICODE_STRING ntPath;
+	ULONG fileAttributes, flags = 0;
+	LARGE_INTEGER allocationSize;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	PF_INIT_OR_SET_STATUS(NtCreateFile, Ntdll);
+	PF_INIT_OR_SET_STATUS(RtlDosPathNameToNtPathNameW, Ntdll);
+	PF_INIT_OR_SET_STATUS(RtlFreeHeap, Ntdll);
+	PF_INIT_OR_SET_STATUS(RtlSetLastWin32ErrorAndNtStatusFromNtStatus, Ntdll);
+
+	if (!NT_SUCCESS(status)) {
+		return CreateFileU(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+			dwCreationDisposition, dwFlagsAndAttributes, NULL);
+	}
+
+	wconvert(lpFileName);
+
+	// Determine creation disposition and flags
+	switch (dwCreationDisposition) {
+	case CREATE_NEW:
+		dwCreationDisposition = FILE_CREATE;
+		break;
+	case CREATE_ALWAYS:
+		dwCreationDisposition = FILE_OVERWRITE_IF;
+		break;
+	case OPEN_EXISTING:
+		dwCreationDisposition = FILE_OPEN;
+		break;
+	case OPEN_ALWAYS:
+		dwCreationDisposition = FILE_OPEN_IF;
+		break;
+	case TRUNCATE_EXISTING:
+		dwCreationDisposition = FILE_OVERWRITE;
+		break;
+	default:
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return INVALID_HANDLE_VALUE;
+	}
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_OVERLAPPED) == 0)
+		flags |= FILE_SYNCHRONOUS_IO_NONALERT;
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_WRITE_THROUGH) != 0)
+		flags |= FILE_WRITE_THROUGH;
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_NO_BUFFERING) != 0)
+		flags |= FILE_NO_INTERMEDIATE_BUFFERING;
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_RANDOM_ACCESS) != 0)
+		flags |= FILE_RANDOM_ACCESS;
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_SEQUENTIAL_SCAN) != 0)
+		flags |= FILE_SEQUENTIAL_ONLY;
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE) != 0) {
+		flags |= FILE_DELETE_ON_CLOSE;
+		dwDesiredAccess |= DELETE;
+	}
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) != 0) {
+		if ((dwDesiredAccess & GENERIC_ALL) != 0)
+			flags |= (FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REMOTE_INSTANCE);
+		else {
+			if ((dwDesiredAccess & GENERIC_READ) != 0)
+				flags |= FILE_OPEN_FOR_BACKUP_INTENT;
+
+			if ((dwDesiredAccess & GENERIC_WRITE) != 0)
+				flags |= FILE_OPEN_REMOTE_INSTANCE;
+		}
+	} else {
+		flags |= FILE_NON_DIRECTORY_FILE;
+	}
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_OPEN_REPARSE_POINT) != 0)
+		flags |= FILE_OPEN_REPARSE_POINT;
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_OPEN_NO_RECALL) != 0)
+		flags |= FILE_OPEN_NO_RECALL;
+
+	fileAttributes = dwFlagsAndAttributes & (FILE_ATTRIBUTE_VALID_FLAGS & ~FILE_ATTRIBUTE_DIRECTORY);
+
+	dwDesiredAccess |= (SYNCHRONIZE | FILE_READ_ATTRIBUTES);
+
+	// Convert DOS path to NT format
+	if (!pfRtlDosPathNameToNtPathNameW(wlpFileName, &ntPath, NULL, NULL)) {
+		wfree(lpFileName);
+		SetLastError(ERROR_FILE_NOT_FOUND);
+		return INVALID_HANDLE_VALUE;
+	}
+
+	InitializeObjectAttributes(&objectAttributes, &ntPath, 0, NULL, NULL);
+
+	if (lpSecurityAttributes != NULL) {
+		if (lpSecurityAttributes->bInheritHandle)
+			objectAttributes.Attributes |= OBJ_INHERIT;
+		objectAttributes.SecurityDescriptor = lpSecurityAttributes->lpSecurityDescriptor;
+	}
+
+	if ((dwFlagsAndAttributes & FILE_FLAG_POSIX_SEMANTICS) == 0)
+		objectAttributes.Attributes |= OBJ_CASE_INSENSITIVE;
+
+	allocationSize.QuadPart = fileSize;
+
+	// Call NtCreateFile
+	status = pfNtCreateFile(&fileHandle, dwDesiredAccess, &objectAttributes, &ioStatusBlock,
+		&allocationSize, fileAttributes, dwShareMode, dwCreationDisposition, flags, NULL, 0);
+
+	pfRtlFreeHeap(RtlGetProcessHeap(), 0, ntPath.Buffer);
+	wfree(lpFileName);
+	pfRtlSetLastWin32ErrorAndNtStatusFromNtStatus(status);
+
+	return fileHandle;
 }

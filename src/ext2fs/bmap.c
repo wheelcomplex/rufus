@@ -305,8 +305,9 @@ errcode_t ext2fs_bmap2(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode *inode,
 {
 	struct ext2_inode inode_buf;
 	ext2_extent_handle_t handle = 0;
+	blk_t addr_per_block;
 	blk_t	b, blk32;
-	blk64_t b64, addr_per_block;
+	blk64_t b64;
 	char	*buf = 0;
 	errcode_t	retval = 0;
 	int		blocks_alloc = 0, inode_dirty = 0;
@@ -330,7 +331,7 @@ errcode_t ext2fs_bmap2(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode *inode,
 			return retval;
 		inode = &inode_buf;
 	}
-	addr_per_block = (blk64_t) fs->blocksize >> 2;
+	addr_per_block = (blk_t) fs->blocksize >> 2;
 
 	if (ext2fs_file_block_offset_too_big(fs, inode, block))
 		return EXT2_ET_FILE_TOO_BIG;
@@ -416,7 +417,7 @@ errcode_t ext2fs_bmap2(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode *inode,
 
 	/* Doubly indirect block  */
 	block -= addr_per_block;
-	if (block < addr_per_block * addr_per_block) {
+	if (block < (blk64_t)addr_per_block * addr_per_block) {
 		b = inode_bmap(inode, EXT2_DIND_BLOCK);
 		if (!b) {
 			if (!(bmap_flags & BMAP_ALLOC)) {
@@ -443,7 +444,7 @@ errcode_t ext2fs_bmap2(ext2_filsys fs, ext2_ino_t ino, struct ext2_inode *inode,
 	}
 
 	/* Triply indirect block */
-	block -= addr_per_block * addr_per_block;
+	block -= (blk64_t)addr_per_block * addr_per_block;
 	b = inode_bmap(inode, EXT2_TIND_BLOCK);
 	if (!b) {
 		if (!(bmap_flags & BMAP_ALLOC)) {
