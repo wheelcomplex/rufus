@@ -22,6 +22,7 @@
 #endif
 
 #include <windows.h>
+#include <windowsx.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -72,6 +73,7 @@ PF_TYPE_DECL(NTAPI, NTSTATUS, NtQueryVolumeInformationFile, (HANDLE, PIO_STATUS_
  */
 RUFUS_DRIVE_INFO SelectedDrive;
 extern BOOL installed_uefi_ntfs, write_as_esp;
+extern int nWindowsVersion, nWindowsBuildNumber;
 uint64_t partition_offset[3];
 uint64_t persistence_size = 0;
 
@@ -404,16 +406,35 @@ char* AltGetLogicalName(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bKeepTr
 	static_strcpy(volume_name, groot_name);
 	if (!QueryDosDeviceA(path, &volume_name[groot_len], (DWORD)(MAX_PATH - groot_len)) || (strlen(volume_name) < 20)) {
 		suprintf("Could not find a DOS volume name for '%s': %s", path, WindowsErrorString());
-		// If we are on the right drive, we enable a custom access mode through physical + offset
-		if (!matching_drive)
-			goto out;
-		static_sprintf(volume_name, "\\\\.\\PhysicalDrive%lu%s %I64u %I64u", DriveIndex, bKeepTrailingBackslash ? "\\" : "",
-			SelectedDrive.PartitionOffset[i], SelectedDrive.PartitionSize[i]);
+		goto out;
 	} else if (bKeepTrailingBackslash) {
 		static_strcat(volume_name, "\\");
 	}
 	ret = safe_strdup(volume_name);
 
+out:
+	return ret;
+}
+
+/*
+ * Custom volume name for extfs formatting (that includes partition offset and partition size)
+ * so that these can be created and accessed on pre 1703 versions of Windows.
+ */
+char* GetExtPartitionName(DWORD DriveIndex, uint64_t PartitionOffset)
+{
+	DWORD i;
+	char* ret = NULL, volume_name[MAX_PATH];
+
+	// Can't operate if we're not on the selected drive
+	if (DriveIndex != SelectedDrive.DeviceNumber)
+		goto out;
+	CheckDriveIndex(DriveIndex);
+	for (i = 0; (i < MAX_PARTITIONS) && (PartitionOffset != SelectedDrive.PartitionOffset[i]); i++);
+	if (i >= MAX_PARTITIONS)
+		goto out;
+	static_sprintf(volume_name, "\\\\.\\PhysicalDrive%lu %I64u %I64u", DriveIndex,
+		SelectedDrive.PartitionOffset[i], SelectedDrive.PartitionSize[i]);
+	ret = safe_strdup(volume_name);
 out:
 	return ret;
 }
@@ -507,7 +528,7 @@ BOOL RefreshLayout(DWORD DriveIndex)
  */
 BOOL DeletePartitions(DWORD DriveIndex)
 {
-	BOOL r = FALSE;
+	BOOL r = FALSE, bNeverFound = TRUE;
 	HRESULT hr;
 	ULONG ulFetched;
 	wchar_t wPhysicalName[24];
@@ -642,6 +663,7 @@ BOOL DeletePartitions(DWORD DriveIndex)
 					IVdsDisk_Release(pDisk);
 					continue;
 				}
+				bNeverFound = FALSE;
 
 				// Instantiate the AdvanceDisk interface for our disk.
 				hr = IVdsDisk_QueryInterface(pDisk, &IID_IVdsAdvancedDisk, (void **)&pAdvancedDisk);
@@ -707,6 +729,8 @@ BOOL DeletePartitions(DWORD DriveIndex)
 	}
 
 out:
+	if (bNeverFound)
+		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_PATH_NOT_FOUND;
 	return r;
 }
 
@@ -1194,7 +1218,7 @@ static BOOL ClearEspInfo(uint8_t index)
  * Needed because Windows 10 doesn't mount ESPs by default, and also
  * doesn't let usermode apps (such as File Explorer) access mounted ESPs.
  */
-BOOL ToggleEsp(DWORD DriveIndex)
+BOOL ToggleEsp(DWORD DriveIndex, uint64_t PartitionOffset)
 {
 	char *volume_name, mount_point[] = DEFAULT_ESP_MOUNT_POINT;
 	BOOL r, ret = FALSE, found = FALSE;
@@ -1204,7 +1228,7 @@ BOOL ToggleEsp(DWORD DriveIndex)
 	GUID* guid;
 	PDRIVE_LAYOUT_INFORMATION_EX DriveLayout = (PDRIVE_LAYOUT_INFORMATION_EX)(void*)layout;
 
-	if (nWindowsVersion < WINDOWS_10) {
+	if ((PartitionOffset == 0) && (nWindowsVersion < WINDOWS_10)) {
 		uprintf("ESP toggling is only available for Windows 10 or later");
 		return FALSE;
 	}
@@ -1219,51 +1243,62 @@ BOOL ToggleEsp(DWORD DriveIndex)
 		uprintf("Could not get layout for drive 0x%02x: %s", DriveIndex, WindowsErrorString());
 		goto out;
 	}
+	// TODO: Handle MBR
 	if (DriveLayout->PartitionStyle != PARTITION_STYLE_GPT) {
 		uprintf("ESP toggling is only available for GPT drives");
 		goto out;
 	}
 
-	// See if the current drive contains an ESP
-	for (i = 0, j = 0; i < DriveLayout->PartitionCount; i++) {
-		if (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP)) {
-			esp_index = i;
-			j++;
-		}
-	}
-
-	if (j > 1) {
-		uprintf("ESP toggling is not available for drives with more than one ESP");
-		goto out;
-	}
-	if (j == 1) {
-		// ESP -> Basic Data
-		i = esp_index;
-		uprintf("ESP name: '%S'", DriveLayout->PartitionEntry[i].Gpt.Name);
-		if (!StoreEspInfo(&DriveLayout->PartitionEntry[i].Gpt.PartitionId)) {
-			uprintf("ESP toggling data could not be stored");
-			goto out;
-		}
-		DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_MICROSOFT_DATA;
-	} else {
-		// Basic Data -> ESP
-		for (j = 1; j <= MAX_ESP_TOGGLE; j++) {
-			guid = GetEspGuid((uint8_t)j);
-			if (guid != NULL) {
-				for (i = 0; i < DriveLayout->PartitionCount; i++) {
-					if (CompareGUID(guid, &DriveLayout->PartitionEntry[i].Gpt.PartitionId)) {
-						uprintf("BD name: '%S'", DriveLayout->PartitionEntry[i].Gpt.Name);
-						found = TRUE;
-						break;
-					}
-				}
-				if (found)
-					break;
+	if (PartitionOffset == 0) {
+		// See if the current drive contains an ESP
+		for (i = 0, j = 0; i < DriveLayout->PartitionCount; i++) {
+			if (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP)) {
+				esp_index = i;
+				j++;
 			}
 		}
-		if (j > MAX_ESP_TOGGLE)
+
+		if (j > 1) {
+			uprintf("ESP toggling is not available for drives with more than one ESP");
 			goto out;
-		DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+		}
+		if (j == 1) {
+			// ESP -> Basic Data
+			i = esp_index;
+			uprintf("ESP name: '%S'", DriveLayout->PartitionEntry[i].Gpt.Name);
+			if (!StoreEspInfo(&DriveLayout->PartitionEntry[i].Gpt.PartitionId)) {
+				uprintf("ESP toggling data could not be stored");
+				goto out;
+			}
+			DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_MICROSOFT_DATA;
+		} else {
+			// Basic Data -> ESP
+			for (j = 1; j <= MAX_ESP_TOGGLE; j++) {
+				guid = GetEspGuid((uint8_t)j);
+				if (guid != NULL) {
+					for (i = 0; i < DriveLayout->PartitionCount; i++) {
+						if (CompareGUID(guid, &DriveLayout->PartitionEntry[i].Gpt.PartitionId)) {
+							found = TRUE;
+							break;
+						}
+					}
+					if (found)
+						break;
+				}
+			}
+			if (j > MAX_ESP_TOGGLE)
+				goto out;
+			DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+		}
+	} else {
+		for (i = 0, j = 0; i < DriveLayout->PartitionCount; i++) {
+			if (DriveLayout->PartitionEntry[i].StartingOffset.QuadPart == PartitionOffset)
+				DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+		}
+	}
+	if (i >= DriveLayout->PartitionCount) {
+		uprintf("No partition to toggle");
+		goto out;
 	}
 
 	DriveLayout->PartitionEntry[i].RewritePartition = TRUE;	// Just in case
@@ -1273,14 +1308,16 @@ BOOL ToggleEsp(DWORD DriveIndex)
 		goto out;
 	}
 	RefreshDriveLayout(hPhysical);
-	if (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP)) {
-		// We successfully reverted ESP from Basic Data -> Delete stored ESP info
-		ClearEspInfo((uint8_t)j);
-	} else if (!IsDriveLetterInUse(*mount_point)) {
-		// We succesfully switched ESP to Basic Data -> Try to mount it
-		volume_name = GetLogicalName(DriveIndex, DriveLayout->PartitionEntry[i].StartingOffset.QuadPart, TRUE, FALSE);
-		IGNORE_RETVAL(MountVolume(mount_point, volume_name));
-		free(volume_name);
+	if (PartitionOffset == 0) {
+		if (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP)) {
+			// We successfully reverted ESP from Basic Data -> Delete stored ESP info
+			ClearEspInfo((uint8_t)j);
+		} else if (!IsDriveLetterInUse(*mount_point)) {
+			// We succesfully switched ESP to Basic Data -> Try to mount it
+			volume_name = GetLogicalName(DriveIndex, DriveLayout->PartitionEntry[i].StartingOffset.QuadPart, TRUE, FALSE);
+			IGNORE_RETVAL(MountVolume(mount_point, volume_name));
+			free(volume_name);
+		}
 	}
 	ret = TRUE;
 
@@ -1354,10 +1391,6 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 		return FALSE;
 	}
 
-#if defined(__GNUC__)
-// GCC 4.9 bugs us about the fact that MS defined an expandable array as array[1]
-#pragma GCC diagnostic ignored "-Warray-bounds"
-#endif
 	switch (DriveLayout->PartitionStyle) {
 	case PARTITION_STYLE_MBR:
 		SelectedDrive.PartitionStyle = PARTITION_STYLE_MBR;
@@ -1522,13 +1555,20 @@ BOOL UnmountVolume(HANDLE hDrive)
 BOOL MountVolume(char* drive_name, char *volume_name)
 {
 	char mounted_guid[52];
+#if defined(WINDOWS_IS_NOT_BUGGY)
 	char mounted_letter[27] = { 0 };
 	DWORD size;
+#endif
 
 	if ((drive_name == NULL) || (volume_name == NULL) || (drive_name[0] == '?') ||
 		(strncmp(volume_name, groot_name, groot_len) == 0))
 		return FALSE;
 
+	// Great: Windows has a *MAJOR BUG* whereas, in some circumstances, GetVolumePathNamesForVolumeName()
+	// can return the *WRONG* drive letter. And yes, we validated that this is *NOT* an issue like stack
+	// or buffer corruption and whatnot. It *IS* a Windows bug. So just drop the idea of updating the
+	// drive letter if already mounted and use the passed target always.
+#if defined(WINDOWS_IS_NOT_BUGGY)
 	// Windows may already have the volume mounted but under a different letter.
 	// If that is the case, update drive_name to that letter.
 	if ( (GetVolumePathNamesForVolumeNameA(volume_name, mounted_letter, sizeof(mounted_letter), &size))
@@ -1538,6 +1578,7 @@ BOOL MountVolume(char* drive_name, char *volume_name)
 		drive_name[0] = mounted_letter[0];
 		return TRUE;
 	}
+#endif
 
 	if (!SetVolumeMountPointA(drive_name, volume_name)) {
 		if (GetLastError() == ERROR_DIR_NOT_EMPTY) {
@@ -1553,7 +1594,7 @@ BOOL MountVolume(char* drive_name, char *volume_name)
 			}
 			uprintf("Retrying after dismount...");
 			if (!DeleteVolumeMountPointA(drive_name))
-				uprintf("Warning: Could not delete volume mountpoint: %s", WindowsErrorString());
+				uprintf("Warning: Could not delete volume mountpoint '%s': %s", drive_name, WindowsErrorString());
 			if (SetVolumeMountPointA(drive_name, volume_name))
 				return TRUE;
 			if ((GetLastError() == ERROR_DIR_NOT_EMPTY) &&
@@ -1586,7 +1627,7 @@ char* AltMountVolume(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bSilent)
 		goto out;
 	}
 	// Can't use a regular volume GUID for ESPs...
-	volume_name = AltGetLogicalName(DriveIndex, PartitionOffset, FALSE, TRUE);
+	volume_name = AltGetLogicalName(DriveIndex, PartitionOffset, FALSE, FALSE);
 	if ((volume_name == NULL) || (strncmp(volume_name, groot_name, groot_len) != 0)) {
 		suprintf("Unexpected volume name: '%s'", volume_name);
 		goto out;
@@ -1694,7 +1735,11 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	DRIVE_LAYOUT_INFORMATION_EX4 DriveLayoutEx = {0};
 	BOOL r;
 	DWORD i, size, bufsize, pn = 0;
-	LONGLONG main_part_size_in_sectors, extra_part_size_in_tracks = 0, esp_size;
+	LONGLONG main_part_size_in_sectors, extra_part_size_in_tracks = 0;
+	// Go for a 260 MB sized ESP by default to keep everyone happy, including 4K sector users:
+	// https://docs.microsoft.com/en-us/windows-hardware/manufacture/desktop/configure-uefigpt-based-hard-drive-partitions
+	// and folks using MacOS: https://github.com/pbatard/rufus/issues/979
+	LONGLONG esp_size = 260 * MB;
 
 	PrintInfoDebug(0, MSG_238, PartitionTypeName[partition_style]);
 
@@ -1716,8 +1761,45 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		// Go with the MS 1 MB wastage at the beginning...
 		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = MB;
 	} else {
-		// Align on Cylinder
-		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = bytes_per_track;
+		// Some folks appear to think that 'Fixes for old BIOSes' is some kind of magic
+		// wand and are adamant to try to apply them when creating *MODERN* VHD drives.
+		// This, however, wrecks havok on MS' internal format calls because, as opposed
+		// to what is the case for regular drives, VHDs require each cluster block to
+		// be aligned to the cluster size, and that may not be the case with the stupid
+		// CHS sizes that IBM imparted upon us. Long story short, we now align to a
+		// cylinder size that is itself aligned to the cluster size.
+		// If this actually breaks old systems, please send your complaints to IBM.
+		LONGLONG ClusterSize = (LONGLONG)ComboBox_GetCurItemData(hClusterSize);
+		if (ClusterSize == 0)
+			ClusterSize = 0x200;
+		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart =
+			((bytes_per_track + (ClusterSize - 1)) / ClusterSize) * ClusterSize;
+	}
+
+	// Having the ESP up front may help (and is the Microsoft recommended way) but this
+	// is only achievable if we can mount more than one partition at once, which means
+	// either fixed drive or Windows 10 1703 or later.
+	if (((SelectedDrive.MediaType == FixedMedia) || (nWindowsBuildNumber > 15000)) &&
+		(extra_partitions & XP_ESP)) {
+		assert(partition_style == PARTITION_STYLE_GPT);
+		extra_part_name = L"EFI System Partition";
+		DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart = esp_size;
+		DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+		uprintf("● Creating %S (offset: %lld, size: %s)", extra_part_name, DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart,
+			SizeToHumanReadable(DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart, TRUE, FALSE));
+		IGNORE_RETVAL(CoCreateGuid(&DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionId));
+		wcsncpy(DriveLayoutEx.PartitionEntry[pn].Gpt.Name, extra_part_name, ARRAYSIZE(DriveLayoutEx.PartitionEntry[pn].Gpt.Name));
+		// Zero the first sectors from this partition to avoid file system caching issues
+		if (!ClearPartition(hDrive, DriveLayoutEx.PartitionEntry[pn].StartingOffset, size_to_clear))
+			uprintf("Could not zero %S: %s", extra_part_name, WindowsErrorString());
+		SelectedDrive.PartitionOffset[pn] = DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart;
+		SelectedDrive.PartitionSize[pn] = DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart;
+		partition_offset[PI_ESP] = SelectedDrive.PartitionOffset[pn];
+		pn++;
+		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = DriveLayoutEx.PartitionEntry[pn - 1].StartingOffset.QuadPart +
+			DriveLayoutEx.PartitionEntry[pn - 1].PartitionLength.QuadPart;
+		// Clear the extra partition we processed
+		extra_partitions &= ~(XP_ESP);
 	}
 
 	// If required, set the MSR partition (GPT only - must be created before the data part)
@@ -1745,7 +1827,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	// Set our main data partition
 	if (write_as_esp) {
 		// Align ESP to 64 MB while leaving at least 32 MB free space
-		esp_size = (((img_report.projected_size / MB) + 96) / 64) * 64 * MB;
+		esp_size = max(esp_size, ((((LONGLONG)img_report.projected_size / MB) + 96) / 64) * 64 * MB);
 		main_part_size_in_sectors = (esp_size - DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart) /
 			SelectedDrive.SectorSize;
 	} else {
@@ -1757,15 +1839,6 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		// Adjust the size according to extra partitions (which we always align to a track)
 		if (extra_partitions & XP_ESP) {
 			extra_part_name = L"EFI System";
-			// The size of the ESP depends on the minimum size we're able to format in FAT32, which
-			// in turn depends on the cluster size used, which in turn depends on the disk sector size.
-			// Plus some people are complaining that the *OFFICIAL MINIMUM SIZE* as documented by Microsoft at
-			// https://docs.microsoft.com/en-us/windows-hardware/manufacture/desktop/configure-uefigpt-based-hard-drive-partitions
-			// is too small. See: https://github.com/pbatard/rufus/issues/979
-			if (SelectedDrive.SectorSize <= 4096)
-				esp_size = 300 * MB;
-			else
-				esp_size = 1200 * MB;	// That'll teach you to have a nonstandard disk!
 			extra_part_size_in_tracks = (esp_size + bytes_per_track - 1) / bytes_per_track;
 		} else if (extra_partitions & XP_UEFI_NTFS) {
 			extra_part_name = L"UEFI:NTFS";

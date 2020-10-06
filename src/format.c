@@ -181,8 +181,12 @@ static BOOLEAN __stdcall FormatExCallback(FILE_SYSTEM_CALLBACK_COMMAND Command, 
 		uprintf("No media in drive");
 		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_NO_MEDIA_IN_DRIVE;
 		break;
+	case FCC_ALIGNMENT_VIOLATION:
+		uprintf("Partition start offset is not aligned to the cluster size");
+		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_OFFSET_ALIGNMENT_VIOLATION;
+		break;
 	default:
-		uprintf("FormatExCallback: Received unhandled command 0x02%X - aborting", Command);
+		uprintf("FormatExCallback: Received unhandled command 0x%02X - aborting", Command);
 		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_NOT_SUPPORTED;
 		break;
 	}
@@ -798,7 +802,7 @@ static BOOL WriteMBR(HANDLE hPhysicalDrive)
 		goto out;
 	}
 
-	switch (ComboBox_GetItemData(hFileSystem, ComboBox_GetCurSel(hFileSystem))) {
+	switch (ComboBox_GetCurItemData(hFileSystem)) {
 	case FS_FAT16:
 		if (buffer[0x1c2] == 0x0e) {
 			uprintf("Partition is already FAT16 LBA...\n");
@@ -819,7 +823,7 @@ static BOOL WriteMBR(HANDLE hPhysicalDrive)
 	if ((boot_type != BT_NON_BOOTABLE) && (target_type == TT_BIOS)) {
 		// Set first partition bootable - masquerade as per the DiskID selected
 		buffer[0x1be] = IsChecked(IDC_RUFUS_MBR) ?
-			(BYTE)ComboBox_GetItemData(hDiskID, ComboBox_GetCurSel(hDiskID)):0x80;
+			(BYTE)ComboBox_GetCurItemData(hDiskID):0x80;
 		uprintf("Set bootable USB partition as 0x%02X\n", buffer[0x1be]);
 	}
 
@@ -1216,8 +1220,8 @@ out:
 // Returns -2 on user cancel, -1 on other error, >=0 on success.
 int SetWinToGoIndex(void)
 {
-	char *mounted_iso, *build, image[128];
-	char tmp_path[MAX_PATH] = "", xml_file[MAX_PATH] = "";
+	char *mounted_iso, *build, mounted_image_path[128];
+	char xml_file[MAX_PATH] = "";
 	char *install_names[MAX_WININST];
 	StrArray version_name, version_index;
 	int i, build_nr = 0;
@@ -1226,8 +1230,8 @@ int SetWinToGoIndex(void)
 	// Sanity checks
 	wintogo_index = -1;
 	wininst_index = 0;
-	if ((nWindowsVersion < WINDOWS_8) || ((WimExtractCheck() & 4) == 0) ||
-		(ComboBox_GetItemData(hFileSystem, ComboBox_GetCurSel(hFileSystem)) != FS_NTFS)) {
+	if ((nWindowsVersion < WINDOWS_8) || ((WimExtractCheck(FALSE) & 4) == 0) ||
+		(ComboBox_GetCurItemData(hFileSystem) != FS_NTFS)) {
 		return -1;
 	}
 
@@ -1243,18 +1247,18 @@ int SetWinToGoIndex(void)
 			wininst_index = 0;
 	}
 
-	// Mount the install.wim image, that resides on the ISO
-	mounted_iso = MountISO(image_path);
-	if (mounted_iso == NULL) {
-		uprintf("Could not mount ISO for Windows To Go selection");
-		return FALSE;
+	// If we're not using a straigth install.wim, we need to mount the ISO to access it
+	if (!img_report.is_windows_img) {
+		mounted_iso = MountISO(image_path);
+		if (mounted_iso == NULL) {
+			uprintf("Could not mount ISO for Windows To Go selection");
+			return FALSE;
+		}
+		static_sprintf(mounted_image_path, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
 	}
-	static_sprintf(image, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
 
 	// Now take a look at the XML file in install.wim to list our versions
-	if ((GetTempPathU(sizeof(tmp_path), tmp_path) == 0)
-		|| (GetTempFileNameU(tmp_path, APPLICATION_NAME, 0, xml_file) == 0)
-		|| (xml_file[0] == 0)) {
+	if ((GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, xml_file) == 0) || (xml_file[0] == 0)) {
 		// Last ditch effort to get a tmp file - just extract it to the current directory
 		static_strcpy(xml_file, ".\\RufVXml.tmp");
 	}
@@ -1262,7 +1266,8 @@ int SetWinToGoIndex(void)
 	DeleteFileU(xml_file);
 
 	// Must use the Windows WIM API as 7z messes up the XML
-	if (!WimExtractFile_API(image, 0, "[1].xml", xml_file)) {
+	if (!WimExtractFile_API(img_report.is_windows_img ? image_path : mounted_image_path,
+		0, "[1].xml", xml_file, FALSE)) {
 		uprintf("Could not acquire WIM index");
 		goto out;
 	}
@@ -1324,25 +1329,19 @@ int SetWinToGoIndex(void)
 
 out:
 	DeleteFileU(xml_file);
-	UnMountISO();
+	if (!img_report.is_windows_img)
+		UnMountISO();
 	return wintogo_index;
 }
 
 // http://technet.microsoft.com/en-ie/library/jj721578.aspx
-// As opposed to the technet guide above, we no longer set internal drives offline,
-// due to people wondering why they can't see them by default.
-//#define SET_INTERNAL_DRIVES_OFFLINE
+// As opposed to the technet guide above, we don't set internal drives offline,
+// due to people wondering why they can't see them by default and we also use
+// bcdedit rather than 'unattend.xml' to disable the recovery environment.
 static BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 {
-#ifdef SET_INTERNAL_DRIVES_OFFLINE
-	static char san_policy_path[] = "?:\\san_policy.xml";
-#endif
-	static char unattend_path[] = "?:\\Windows\\System32\\sysprep\\unattend.xml";
-	char *mounted_iso, *ms_efi = NULL, image[128], cmd[MAX_PATH];
-	unsigned char *buffer;
-	DWORD bufsize;
+	char *mounted_iso, *ms_efi = NULL, mounted_image_path[128], cmd[MAX_PATH];
 	ULONG cluster_size;
-	FILE* fd;
 
 	uprintf("Windows To Go mode selected");
 	// Additional sanity checks
@@ -1351,25 +1350,28 @@ static BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 		return FALSE;
 	}
 
-	// First, we need to access the install.wim image, that resides on the ISO
-	mounted_iso = MountISO(image_path);
-	if (mounted_iso == NULL) {
-		uprintf("Could not mount ISO for Windows To Go installation");
-		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_ISO_EXTRACT);
-		return FALSE;
+	if (!img_report.is_windows_img) {
+		mounted_iso = MountISO(image_path);
+		if (mounted_iso == NULL) {
+			uprintf("Could not mount ISO for Windows To Go installation");
+			FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
+			return FALSE;
+		}
+		static_sprintf(mounted_image_path, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
+		uprintf("Mounted ISO as '%s'", mounted_iso);
 	}
-	static_sprintf(image, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
-	uprintf("Mounted ISO as '%s'", mounted_iso);
 
 	// Now we use the WIM API to apply that image
-	if (!WimApplyImage(image, wintogo_index, drive_name)) {
+	if (!WimApplyImage(img_report.is_windows_img ? image_path : mounted_image_path, wintogo_index, drive_name)) {
 		uprintf("Failed to apply Windows To Go image");
 		if (!IS_ERROR(FormatStatus))
 			FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_ISO_EXTRACT);
-		UnMountISO();
+		if (!img_report.is_windows_img)
+			UnMountISO();
 		return FALSE;
 	}
-	UnMountISO();
+	if (!img_report.is_windows_img)
+		UnMountISO();
 
 	if (use_esp) {
 		uprintf("Setting up EFI System Partition");
@@ -1402,59 +1404,35 @@ static BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 	}
 
 	// We invoke the 'bcdboot' command from the host, as the one from the drive produces problems (#558)
+	// and of course, we couldn't invoke an ARM64 'bcdboot' binary on an x86 host anyway...
 	// Also, since Rufus should (usually) be running as a 32 bit app, on 64 bit systems, we need to use
 	// 'C:\Windows\Sysnative' and not 'C:\Windows\System32' to invoke bcdboot, as 'C:\Windows\System32'
 	// will get converted to 'C:\Windows\SysWOW64' behind the scenes, and there is no bcdboot.exe there.
+	uprintf("Enabling boot using command:");
 	static_sprintf(cmd, "%s\\bcdboot.exe %s\\Windows /v /f %s /s %s", sysnative_dir, drive_name,
 		HAS_BOOTMGR_BIOS(img_report) ? (HAS_BOOTMGR_EFI(img_report) ? "ALL" : "BIOS") : "UEFI",
 		(use_esp)?ms_efi:drive_name);
-	uprintf("Enabling boot using command '%s'", cmd);
+	uprintf(cmd);
 	if (RunCommand(cmd, sysnative_dir, usb_debug) != 0) {
 		// Try to continue... but report a failure
 		uprintf("Failed to enable boot");
 		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
 	}
 
+	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_proc_files + 2 * wim_extra_files, wim_nb_files);
+
+	uprintf("Disable the use of the Windows Recovery Environment using command:");
+	static_sprintf(cmd, "%s\\bcdedit.exe /store %s\\EFI\\Microsoft\\Boot\\BCD /set {default} recoveryenabled no",
+		sysnative_dir, (use_esp) ? ms_efi : drive_name);
+	uprintf(cmd);
+	RunCommand(cmd, sysnative_dir, usb_debug);
+
+	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_nb_files, wim_nb_files);
+
 	if (use_esp) {
 		Sleep(200);
 		AltUnmountVolume(ms_efi, FALSE);
 	}
-	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_proc_files + 2 * wim_extra_files, wim_nb_files);
-
-	// The following are non fatal if they fail
-
-#ifdef SET_INTERNAL_DRIVES_OFFLINE
-	uprintf("Applying 'san_policy.xml', to set the target's internal drives offline...");
-	buffer = GetResource(hMainInstance, MAKEINTRESOURCEA(IDR_TOGO_SAN_POLICY_XML),
-		_RT_RCDATA, "san_policy.xml", &bufsize, FALSE);
-	san_policy_path[0] = drive_name[0];
-	fd = fopenU(san_policy_path, "wb");
-	if ((fd == NULL) || (fwrite(buffer, 1, bufsize, fd) != bufsize)) {
-		uprintf("Could not write '%s'\n", san_policy_path);
-		if (fd)
-			fclose(fd);
-	} else {
-		fclose(fd);
-		// Can't use the one from the USB (at least for Windows 10 preview), as you'll get
-		// "Error: 0x800401f0  An error occurred while initializing COM security".
-		// On the other hand, using Windows 8.1 dism against Windows 10 doesn't work either
-		// (you get a message about needing to upgrade to latest AIK)...
-		static_sprintf(cmd, "dism /Image:%s\\ /Apply-Unattend:%s", drive_name, san_policy_path);
-		if (RunCommand(cmd, NULL, TRUE) != 0)
-			uprintf("Command '%s' failed to run", cmd);
-	}
-#endif
-
-	uprintf("Copying 'unattend.xml', to disable the use of the Windows Recovery Environment...");
-	buffer = GetResource(hMainInstance, MAKEINTRESOURCEA(IDR_TOGO_UNATTEND_XML),
-		_RT_RCDATA, "unattend.xml", &bufsize, FALSE);
-	unattend_path[0] = drive_name[0];
-	fd = fopenU(unattend_path, "wb");
-	if ((fd == NULL) || (fwrite(buffer, 1, bufsize, fd) != bufsize))
-		uprintf("Could not write '%s'", unattend_path);
-	if (fd != NULL)
-		fclose(fd);
-	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_nb_files, wim_nb_files);
 
 	return TRUE;
 }
@@ -1717,7 +1695,7 @@ DWORD WINAPI FormatThread(void* param)
 
 	use_large_fat32 = (fs_type == FS_FAT32) && ((SelectedDrive.DiskSize > LARGE_FAT32_SIZE) || (force_large_fat32));
 	windows_to_go = (image_options & IMOP_WINTOGO) && (boot_type == BT_IMAGE) && HAS_WINTOGO(img_report) &&
-		(ComboBox_GetCurSel(GetDlgItem(hMainDialog, IDC_IMAGE_OPTION)) == 1);
+		ComboBox_GetCurItemData(hImageOption);
 	large_drive = (SelectedDrive.DiskSize > (1*TB));
 	if (large_drive)
 		uprintf("Notice: Large drive detected (may produce short writes)");
@@ -1754,7 +1732,7 @@ DWORD WINAPI FormatThread(void* param)
 	}
 	if (drive_letters[0] == 0) {
 		uprintf("No drive letter was assigned...");
-		drive_name[0] =  GetUnusedDriveLetter();
+		drive_name[0] = GetUnusedDriveLetter();
 		if (drive_name[0] == 0) {
 			uprintf("Could not find a suitable drive letter");
 			FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_ASSIGN_LETTER);
@@ -1784,7 +1762,7 @@ DWORD WINAPI FormatThread(void* param)
 	// It kind of blows, but we have to relinquish access to the physical drive
 	// for VDS to be able to delete the partitions that reside on it...
 	safe_unlockclose(hPhysicalDrive);
-	PrintInfoDebug(0, MSG_239, lmprintf(MSG_307));
+	PrintInfo(0, MSG_239, lmprintf(MSG_307));
 	if (!DeletePartitions(DriveIndex)) {
 		SetLastError(FormatStatus);
 		uprintf("Notice: Could not delete partitions: %s", WindowsErrorString());
@@ -2001,7 +1979,7 @@ DWORD WINAPI FormatThread(void* param)
 	GetWindowTextU(hLabel, label, sizeof(label));
 	if (fs_type < FS_EXT2)
 		ToValidLabel(label, (fs_type == FS_FAT16) || (fs_type == FS_FAT32) || (fs_type == FS_EXFAT));
-	ClusterSize = (DWORD)ComboBox_GetItemData(hClusterSize, ComboBox_GetCurSel(hClusterSize));
+	ClusterSize = (DWORD)ComboBox_GetCurItemData(hClusterSize);
 	if ((ClusterSize < 0x200) || (write_as_esp))
 		ClusterSize = 0;	// 0 = default cluster size
 
@@ -2141,17 +2119,18 @@ DWORD WINAPI FormatThread(void* param)
 				IsFileInDB(FILES_DIR "\\grub4dos-" GRUB4DOS_VERSION "\\grldr")?"✓":"✗");
 			if (!CopyFileU(FILES_DIR "\\grub4dos-" GRUB4DOS_VERSION "\\grldr", grub4dos_dst, FALSE))
 				uprintf("Failed to copy file: %s", WindowsErrorString());
-		} else if ((boot_type == BT_IMAGE) && (image_path != NULL) && (img_report.is_iso)) {
+		} else if ((boot_type == BT_IMAGE) && (image_path != NULL) && (img_report.is_iso || img_report.is_windows_img)) {
 			UpdateProgress(OP_FILE_COPY, 0.0f);
 			drive_name[2] = 0;	// Ensure our drive is something like 'D:'
 			if (windows_to_go) {
 				PrintInfoDebug(0, MSG_268);
 				if (!SetupWinToGo(DriveIndex, drive_name, (extra_partitions & XP_ESP))) {
 					if (!IS_ERROR(FormatStatus))
-						FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_ISO_EXTRACT);
+						FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
 					goto out;
 				}
 			} else {
+				assert(!img_report.is_windows_img);
 				if (!ExtractISO(image_path, drive_name, FALSE)) {
 					if (!IS_ERROR(FormatStatus))
 						FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_ISO_EXTRACT);
@@ -2167,7 +2146,8 @@ DWORD WINAPI FormatThread(void* param)
 				}
 				// EFI mode selected, with no 'boot###.efi' but Windows 7 x64's 'bootmgr.efi' (bit #0)
 				if (((target_type == TT_UEFI) || allow_dual_uefi_bios) && HAS_WIN7_EFI(img_report)) {
-					PrintInfoDebug(0, MSG_232, lmprintf(MSG_307));
+					PrintInfo(0, MSG_232, lmprintf(MSG_307));
+					uprintf("Win7 EFI boot setup");
 					img_report.wininst_path[0][0] = drive_name[0];
 					efi_dst[0] = drive_name[0];
 					efi_dst[sizeof(efi_dst) - sizeof("\\bootx64.efi")] = 0;
@@ -2176,7 +2156,7 @@ DWORD WINAPI FormatThread(void* param)
 						FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_PATCH);
 					} else {
 						efi_dst[sizeof(efi_dst) - sizeof("\\bootx64.efi")] = '\\';
-						if (!WimExtractFile(img_report.wininst_path[0], 1, "Windows\\Boot\\EFI\\bootmgfw.efi", efi_dst)) {
+						if (!WimExtractFile(img_report.wininst_path[0], 1, "Windows\\Boot\\EFI\\bootmgfw.efi", efi_dst, FALSE)) {
 							uprintf("Failed to setup Win7 EFI boot");
 							FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_PATCH);
 						}

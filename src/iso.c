@@ -59,6 +59,10 @@
 #define S_IFLNK                   0xA000
 #define S_ISLNK(m)                (((m) & S_IFMT) == S_IFLNK)
 
+// Set the iso_open_ext() extension mask according to our global options
+#define ISO_EXTENSION_MASK        (ISO_EXTENSION_ALL & (enable_joliet ? ISO_EXTENSION_ALL : ~ISO_EXTENSION_JOLIET) & \
+                                  (enable_rockridge ? ISO_EXTENSION_ALL : ~ISO_EXTENSION_ROCK_RIDGE))
+
 // Needed for UDF ISO access
 CdIo_t* cdio_open (const char* psz_source, driver_id_t driver_id) {return NULL;}
 void cdio_destroy (CdIo_t* p_cdio) {}
@@ -89,7 +93,9 @@ static const char* ldlinux_c32 = "ldlinux.c32";
 static const char* md5sum_name[] = { "MD5SUMS", "md5sum.txt" };
 static const char* casper_dirname = "/casper";
 static const char* efi_dirname = "/efi/boot";
-static const char* efi_bootname[] = { "bootia32.efi", "bootia64.efi", "bootx64.efi", "bootarm.efi", "bootaa64.efi", "bootebc.efi" };
+static const char* efi_bootname[MAX_ARCHS] = {
+	"bootia32.efi", "bootia64.efi", "bootx64.efi", "bootarm.efi", "bootaa64.efi",
+	"bootebc.efi", "bootriscv32.efi", "bootriscv64.efi", "bootriscv128.efi" };
 static const char* sources_str = "/sources";
 static const char* wininst_name[] = { "install.wim", "install.esd", "install.swm" };
 // We only support GRUB/BIOS (x86) that uses a standard config dir (/boot/grub/i386-pc/)
@@ -249,7 +255,7 @@ static BOOL check_iso_props(const char* psz_dirname, int64_t file_length, const 
 
 		// Check for the EFI boot entries
 		if (safe_stricmp(psz_dirname, efi_dirname) == 0) {
-			for (i=0; i<ARRAYSIZE(efi_bootname); i++)
+			for (i = 0; i < ARRAYSIZE(efi_bootname); i++)
 				if (safe_stricmp(psz_basename, efi_bootname[i]) == 0)
 					img_report.has_efi |= (2 << i);	// start at 2 since "bootmgr.efi" is bit 0
 		}
@@ -592,16 +598,16 @@ static void update_md5sum(void)
 	char md5_path[64], *md5_data = NULL, *str_pos;
 
 	if (!img_report.has_md5sum)
-		return;
+		goto out;
 
 	assert(img_report.has_md5sum <= ARRAYSIZE(md5sum_name));
 	if (img_report.has_md5sum > ARRAYSIZE(md5sum_name))
-		return;
+		goto out;
 
 	static_sprintf(md5_path, "%s\\%s", psz_extract_dir, md5sum_name[img_report.has_md5sum - 1]);
 	md5_size = read_file(md5_path, (uint8_t**)&md5_data);
 	if (md5_size == 0)
-		return;
+		goto out;
 
 	for (i = 0; i < modified_path.Index; i++) {
 		str_pos = strstr(md5_data, &modified_path.String[i][2]);
@@ -629,9 +635,12 @@ static void update_md5sum(void)
 
 	write_file(md5_path, md5_data, md5_size);
 	free(md5_data);
+
+out:
+	StrArrayDestroy(&modified_path);
 }
 
-// Returns 0 on success, nonzero on error
+// Returns 0 on success, >0 on error, <0 to ignore current dir
 static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 {
 	HANDLE file_handle = NULL;
@@ -668,9 +677,20 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 	_CDIO_LIST_FOREACH(p_entnode, p_entlist) {
 		if (FormatStatus) goto out;
 		p_statbuf = (iso9660_stat_t*) _cdio_list_node_data(p_entnode);
-		if ((p_statbuf->rr.b3_rock == yep) && enable_rockridge) {
-			if (p_statbuf->rr.u_su_fields & ISO_ROCK_SUF_PL)
+		if (scan_only && (p_statbuf->rr.b3_rock == yep) && enable_rockridge) {
+			if (p_statbuf->rr.u_su_fields & ISO_ROCK_SUF_PL) {
 				img_report.has_deep_directories = TRUE;
+				// Due to the nature of the parsing of Rock Ridge deep directories
+				// which requires performing a *very costly* search of the whole
+				// ISO9660 file system to find the matching LSN, ISOs with loads of
+				// deep directory entries (e.g. OPNsense) are very slow to parse...
+				// To speed up the scan process, and since we expect deep directory
+				// entries to appear below anything we care for, we cut things
+				// short by telling the parent not to bother any further once we
+				// find that we are dealing with a deep directory.
+				r = -1;
+				goto out;
+			}
 		}
 		// Eliminate . and .. entries
 		if ( (strcmp(p_statbuf->filename, ".") == 0)
@@ -702,15 +722,18 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 				}
 				safe_free(psz_sanpath);
 			}
-			if (iso_extract_files(p_iso, psz_iso_name))
+			r = iso_extract_files(p_iso, psz_iso_name);
+			if (r > 0)
 				goto out;
+			if (r < 0)	// Stop processing current dir
+				break;
 		} else {
 			file_length = p_statbuf->total_size;
 			if (check_iso_props(psz_path, file_length, psz_basename, psz_fullpath, &props)) {
 				continue;
 			}
 			print_extracted_file(psz_fullpath, file_length);
-			for (i=0; i<NB_OLD_C32; i++) {
+			for (i = 0; i < NB_OLD_C32; i++) {
 				if (props.is_old_c32[i] && use_own_c32[i]) {
 					static_sprintf(tmp, "%s/syslinux-%s/%s", FILES_DIR, embedded_sl_version_str[0], old_c32_name[i]);
 					if (CopyFileU(tmp, psz_fullpath, FALSE)) {
@@ -1005,7 +1028,7 @@ out:
 			}
 		}
 		if (!IS_EFI_BOOTABLE(img_report) && HAS_EFI_IMG(img_report) && HasEfiImgBootLoaders()) {
-			img_report.has_efi = 0x80;
+			img_report.has_efi = 0x8000;
 		}
 		if (HAS_WINPE(img_report)) {
 			// In case we have a WinPE 1.x based iso, we extract and parse txtsetup.sif
@@ -1030,7 +1053,8 @@ out:
 		if (img_report.has_grub2) {
 			// In case we have a GRUB2 based iso, we extract boot/grub/i386-pc/normal.mod to parse its version
 			img_report.grub2_version[0] = 0;
-			if ((GetTempPathU(sizeof(path), path) != 0) && (GetTempFileNameU(path, APPLICATION_NAME, 0, path) != 0)) {
+			// coverity[swapped_arguments]
+			if (GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, path) != 0) {
 				size = (size_t)ExtractISOFile(src_iso, "boot/grub/i386-pc/normal.mod", path, FILE_ATTRIBUTE_NORMAL);
 				buf = (char*)calloc(size, 1);
 				fd = fopen(path, "rb");
@@ -1056,7 +1080,7 @@ out:
 		SendMessage(hMainDialog, UM_PROGRESS_EXIT, 0, 0);
 	} else {
 		// Solus and other ISOs only provide EFI boot files in a FAT efi.img
-		if (img_report.has_efi == 0x80)
+		if (img_report.has_efi == 0x8000)
 			DumpFatDir(dest_dir, 0);
 		if (HAS_SYSLINUX(img_report)) {
 			static_sprintf(path, "%s\\syslinux.cfg", dest_dir);
@@ -1087,12 +1111,11 @@ out:
 			}
 			if (fd != NULL)
 				fclose(fd);
-			update_md5sum();
 		} else if (HAS_BOOTMGR(img_report) && enable_ntfs_compression) {
 			// bootmgr might need to be uncompressed: https://github.com/pbatard/rufus/issues/1381
 			RunCommand("compact /u bootmgr* efi/boot/*.efi", dest_dir, TRUE);
 		}
-		StrArrayDestroy(&modified_path);
+		update_md5sum();
 		if (archive_path != NULL) {
 			uprintf("● Adding files from %s", archive_path);
 			bled_init(NULL, NULL, NULL, NULL, alt_print_extracted_file, NULL);
@@ -1164,7 +1187,9 @@ int64_t ExtractISOFile(const char* iso, const char* iso_file, const char* dest_f
 	goto out;
 
 try_iso:
-	p_iso = iso9660_open(iso);
+	// Make sure to enable extensions, else we may not match the name of the file we are looking
+	// for since Rock Ridge may be needed to translate something like 'I386_PC' into 'i386-pc'...
+	p_iso = iso9660_open_ext(iso, ISO_EXTENSION_MASK);
 	if (p_iso == NULL) {
 		uprintf("Unable to open image '%s'", iso);
 		goto out;
@@ -1249,7 +1274,7 @@ uint32_t GetInstallWimVersion(const char* iso)
 	goto out;
 
 try_iso:
-	p_iso = iso9660_open(iso);
+	p_iso = iso9660_open_ext(iso, ISO_EXTENSION_MASK);
 	if (p_iso == NULL) {
 		uprintf("Could not open image '%s'", iso);
 		goto out;
@@ -1336,7 +1361,7 @@ BOOL HasEfiImgBootLoaders(void)
 	if ((image_path == NULL) || !HAS_EFI_IMG(img_report))
 		return FALSE;
 
-	p_iso = iso9660_open(image_path);
+	p_iso = iso9660_open_ext(image_path, ISO_EXTENSION_MASK);
 	if (p_iso == NULL) {
 		uprintf("Could not open image '%s' as an ISO-9660 file system", image_path);
 		goto out;
@@ -1372,17 +1397,16 @@ BOOL HasEfiImgBootLoaders(void)
 	dc = direntry.entry[26] + (direntry.entry[27] << 8);
 
 	for (i = 0; i < ARRAYSIZE(efi_bootname); i++) {
-		// Sanity check in case the EFI forum comes up with a 'bootmips64.efi' or something...
-		if (strlen(efi_bootname[i]) > 12) {
-			uprintf("Internal error: FAT 8.3");
+		// TODO: bootriscv###.efi will need LFN support but cross that bridge when/if we get there...
+		if (strlen(efi_bootname[i]) > 12)
 			continue;
-		}
 		for (j = 0, k = 0; efi_bootname[i][j] != 0; j++) {
 			if (efi_bootname[i][j] == '.') {
 				while (k < 8)
 					name[k++] = ' ';
-			} else
+			} else {
 				name[k++] = toupper(efi_bootname[i][j]);
+			}
 		}
 		c = libfat_searchdir(lf_fs, dc, name, &direntry);
 		if (c > 0) {
@@ -1428,7 +1452,7 @@ BOOL DumpFatDir(const char* path, int32_t cluster)
 		// Root dir => Perform init stuff
 		if (image_path == NULL)
 			return FALSE;
-		p_iso = iso9660_open(image_path);
+		p_iso = iso9660_open_ext(image_path, ISO_EXTENSION_MASK);
 		if (p_iso == NULL) {
 			uprintf("Could not open image '%s' as an ISO-9660 file system", image_path);
 			goto out;

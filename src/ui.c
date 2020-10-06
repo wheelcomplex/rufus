@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * UI-related function calls
- * Copyright © 2018-2019 Pete Batard <pete@akeo.ie>
+ * Copyright © 2018-2020 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <oleacc.h>
 #include <winioctl.h>
 #include <assert.h>
 
@@ -54,6 +55,7 @@ static int rh, ddh, bw, hw, fw;
 static int sw, mw, bsw, sbw, ssw, tw, dbw;
 static WNDPROC progress_original_proc = NULL;
 static wchar_t wtbtext[2][128];
+static IAccPropServices* pfaps = NULL;
 
 /*
  * The following is used to allocate slots within the progress bar
@@ -66,6 +68,21 @@ static wchar_t wtbtext[2][128];
 static int nb_slots[OP_MAX];
 static float slot_end[OP_MAX+1];	// shifted +1 so that we can subtract 1 to OP indexes
 static float previous_end;
+
+void SetAccessibleName(HWND hCtrl, const char* name)
+{
+	const MSAAPROPID props[] = { Name_Property_GUID };
+	wchar_t* wname = utf8_to_wchar(name);
+
+	SetWindowTextW(hCtrl, wname);
+	if (pfaps == NULL)
+		IGNORE_RETVAL(CoCreateInstance(&CLSID_AccPropServices, NULL, CLSCTX_INPROC, &IID_IAccPropServices, (LPVOID)&pfaps));
+	if (pfaps != NULL) {
+		IAccPropServices_ClearHwndProps(pfaps, hCtrl, OBJID_CLIENT, CHILDID_SELF, props, ARRAYSIZE(props));
+		IAccPropServices_SetHwndPropStr(pfaps, hCtrl, OBJID_CLIENT, CHILDID_SELF, Name_Property_GUID, wname);
+	}
+	free(wname);
+}
 
 // Set the combo selection according to the data
 void SetComboEntry(HWND hDlg, int data)
@@ -254,8 +271,8 @@ void GetFullWidth(HWND hDlg)
 	fw = rc.right - rc.left - ddw;
 
 	// Go through the Image Options for Windows To Go
-	fw = max(fw, GetTextSize(GetDlgItem(hDlg, IDC_IMAGE_OPTION), lmprintf(MSG_117)).cx);
-	fw = max(fw, GetTextSize(GetDlgItem(hDlg, IDC_IMAGE_OPTION), lmprintf(MSG_118)).cx);
+	fw = max(fw, GetTextSize(hImageOption, lmprintf(MSG_117)).cx);
+	fw = max(fw, GetTextSize(hImageOption, lmprintf(MSG_118)).cx);
 
 	// Now deal with full length checkbox lines
 	for (i = 0; i<ARRAYSIZE(full_width_checkboxes); i++)
@@ -411,7 +428,7 @@ void PositionMainControls(HWND hDlg)
 	hCtrl = GetDlgItem(hDlg, IDC_PERSISTENCE_SLIDER);
 	GetWindowRect(hCtrl, &rc);
 	MapWindowPoints(NULL, hDlg, (POINT*)&rc, 2);
-	SetWindowPos(hCtrl, GetDlgItem(hDlg, IDC_IMAGE_OPTION), mw, rc.top, bsw, rc.bottom - rc.top, 0);
+	SetWindowPos(hCtrl, hImageOption, mw, rc.top, bsw, rc.bottom - rc.top, 0);
 
 	// Reposition the Persistence Units dropdown (no need to resize)
 	hCtrl = GetDlgItem(hDlg, IDC_PERSISTENCE_UNITS);
@@ -438,7 +455,7 @@ void PositionMainControls(HWND hDlg)
 		// Still need to adjust the width of the device selection dropdown
 		GetWindowRect(hDeviceList, &rc);
 		MapWindowPoints(NULL, hMainDialog, (POINT*)&rc, 2);
-		SetWindowPos(hDeviceList, HWND_TOP, rc.left, rc.top, fw - ssw - sbw, rc.bottom - rc.top, 0);
+		SetWindowPos(hDeviceList, GetDlgItem(hDlg, IDS_DEVICE_TXT), rc.left, rc.top, fw - ssw - sbw, rc.bottom - rc.top, 0);
 	}
 
 	// Resize the full width controls
@@ -605,7 +622,7 @@ void ToggleAdvancedDeviceOptions(BOOL enable)
 
 	GetWindowRect(hDeviceList, &rc);
 	MapWindowPoints(NULL, hMainDialog, (POINT*)&rc, 2);
-	SetWindowPos(hDeviceList, HWND_TOP, rc.left, rc.top, enable ? fw - ssw - sbw : fw, rc.bottom - rc.top, 0);
+	SetWindowPos(hDeviceList, GetDlgItem(hMainDialog, IDS_DEVICE_TXT), rc.left, rc.top, enable ? fw - ssw - sbw : fw, rc.bottom - rc.top, 0);
 
 	// Resize the main dialog and log window
 	ResizeDialogs(shift);
@@ -654,7 +671,7 @@ void ToggleAdvancedFormatOptions(BOOL enable)
 	InvalidateRect(hMainDialog, NULL, TRUE);
 }
 
-// Toggle the display of peristence unit dropdown and resize the size field
+// Toggle the display of persistence unit dropdown and resize the size field
 void TogglePersistenceControls(BOOL display)
 {
 	RECT rc;
@@ -730,12 +747,15 @@ void SetPersistenceSize(void)
 			persistence_unit_selection = proposed_unit_selection;
 
 		IGNORE_RETVAL(ComboBox_SetCurSel(hCtrl, persistence_unit_selection));
+		if ((pos != 0) && (pos < MIN_EXT_SIZE))
+			pos = MIN_EXT_SIZE;
 		pos /= MB;
 		max /= MB;
 		for (i = 0; i < persistence_unit_selection; i++) {
 			pos /= 1024;
 			max /= 1024;
 		}
+
 	}
 
 	hCtrl = GetDlgItem(hMainDialog, IDC_PERSISTENCE_SLIDER);
@@ -755,7 +775,8 @@ void ToggleImageOptions(void)
 	uint8_t entry_image_options = image_options;
 	int i, shift = rh;
 
-	has_wintogo = ((boot_type == BT_IMAGE) && (image_path != NULL) && (img_report.is_iso) && (nWindowsVersion >= WINDOWS_8) && (HAS_WINTOGO(img_report)));
+	has_wintogo = ((boot_type == BT_IMAGE) && (image_path != NULL) && (img_report.is_iso || img_report.is_windows_img) &&
+		(nWindowsVersion >= WINDOWS_8) && (HAS_WINTOGO(img_report)));
 	has_persistence = ((boot_type == BT_IMAGE) && (image_path != NULL) && (img_report.is_iso) && (HAS_PERSISTENCE(img_report)));
 
 	assert(popcnt8(image_options) <= 1);
@@ -767,13 +788,20 @@ void ToggleImageOptions(void)
 	if ( ((has_wintogo) && !(image_options & IMOP_WINTOGO)) ||
 		 ((!has_wintogo) && (image_options & IMOP_WINTOGO)) ) {
 		image_options ^= IMOP_WINTOGO;
-		// Set the Windows To Go selection in the dropdown
-		IGNORE_RETVAL(ComboBox_SetCurSel(GetDlgItem(hMainDialog, IDC_IMAGE_OPTION), windows_to_go_selection));
+		if (image_options & IMOP_WINTOGO) {
+			// Set the Windows To Go selection in the dropdown
+			IGNORE_RETVAL(ComboBox_SetCurSel(hImageOption, (img_report.is_windows_img || !windows_to_go_selected) ? 0 : 1));
+		}
 	}
 
 	if (((has_persistence) && !(image_options & IMOP_PERSISTENCE)) ||
 		((!has_persistence) && (image_options & IMOP_PERSISTENCE))) {
 		image_options ^= IMOP_PERSISTENCE;
+		if (image_options & IMOP_PERSISTENCE) {
+			SetWindowTextU(GetDlgItem(hMainDialog, IDS_IMAGE_OPTION_TXT), lmprintf(MSG_123));
+			TogglePersistenceControls(persistence_size != 0);
+			SetPersistenceSize();
+		}
 	}
 
 	if ( ((entry_image_options != 0) && (has_wintogo || has_persistence)) ||
@@ -797,15 +825,6 @@ void ToggleImageOptions(void)
 	for (i = 0; i < ARRAYSIZE(image_option_toggle_ids); i++) {
 		ShowWindow(GetDlgItem(hMainDialog, image_option_toggle_ids[i][0]),
 			(image_options & image_option_toggle_ids[i][1]) ? SW_SHOW : SW_HIDE);
-	}
-	// Set the dropdown default selection
-	if (image_options & IMOP_WINTOGO) {
-		SetWindowTextU(GetDlgItem(hMainDialog, IDS_IMAGE_OPTION_TXT), image_option_txt);
-		IGNORE_RETVAL(ComboBox_SetCurSel(GetDlgItem(hMainDialog, IDC_IMAGE_OPTION), windows_to_go_selection));
-	} else if (image_options & IMOP_PERSISTENCE) {
-		SetWindowTextU(GetDlgItem(hMainDialog, IDS_IMAGE_OPTION_TXT), lmprintf(MSG_123));
-		TogglePersistenceControls(persistence_size != 0);
-		SetPersistenceSize();
 	}
 	// If you don't force a redraw here, all kind of bad UI artifacts happen...
 	InvalidateRect(hMainDialog, NULL, TRUE);
@@ -841,6 +860,7 @@ void CreateSmallButtons(HWND hDlg)
 	tbToolbarButtons[0].fsState = TBSTATE_ENABLED;
 	tbToolbarButtons[0].iBitmap = 0;
 	SendMessage(hSaveToolbar, TB_ADDBUTTONS, (WPARAM)1, (LPARAM)&tbToolbarButtons);
+	SetAccessibleName(hSaveToolbar, lmprintf(MSG_313));
 
 	hHashToolbar = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, TOOLBAR_STYLE,
 		0, 0, 0, 0, hMainDialog, (HMENU)IDC_HASH_TOOLBAR, hMainInstance, NULL);
@@ -857,6 +877,7 @@ void CreateSmallButtons(HWND hDlg)
 	tbToolbarButtons[0].fsState = TBSTATE_ENABLED;
 	tbToolbarButtons[0].iBitmap = 0;
 	SendMessage(hHashToolbar, TB_ADDBUTTONS, (WPARAM)1, (LPARAM)&tbToolbarButtons);
+	SetAccessibleName(hHashToolbar, lmprintf(MSG_314));
 }
 
 static INT_PTR CALLBACK ProgressCallback(HWND hCtrl, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1058,6 +1079,7 @@ void CreateAdditionalControls(HWND hDlg)
 	if (sz.cx < 16)
 		sz.cx = fw;
 	SetWindowPos(hAdvancedDeviceToolbar, hTargetSystem, rc.left + toolbar_dx, rc.top, sz.cx, rc.bottom - rc.top, 0);
+	SetAccessibleName(hAdvancedDeviceToolbar, lmprintf(MSG_119));
 
 	utf8_to_wchar_no_alloc(lmprintf((advanced_mode_format) ? MSG_122 : MSG_121, lmprintf(MSG_120)), wtbtext[1], ARRAYSIZE(wtbtext[1]));
 	hAdvancedFormatToolbar = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, TOOLBAR_STYLE,
@@ -1078,6 +1100,7 @@ void CreateAdditionalControls(HWND hDlg)
 	if (sz.cx < 16)
 		sz.cx = fw;
 	SetWindowPos(hAdvancedFormatToolbar, hClusterSize, rc.left + toolbar_dx, rc.top, sz.cx, rc.bottom - rc.top, 0);
+	SetAccessibleName(hAdvancedFormatToolbar, lmprintf(MSG_120));
 
 	// Create the multi toolbar
 	hMultiToolbar = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, TOOLBAR_STYLE,
@@ -1126,6 +1149,7 @@ void CreateAdditionalControls(HWND hDlg)
 	tbToolbarButtons[6].iBitmap = 3;
 	SendMessage(hMultiToolbar, TB_ADDBUTTONS, (WPARAM)7, (LPARAM)&tbToolbarButtons);
 	SendMessage(hMultiToolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(i16, ddbh));
+	SetAccessibleName(hMultiToolbar, lmprintf(MSG_315));
 
 	// Subclass the progress bar so that we can write on it
 	progress_original_proc = (WNDPROC)SetWindowLongPtr(hProgress, GWLP_WNDPROC, (LONG_PTR)ProgressCallback);
@@ -1158,21 +1182,21 @@ void InitProgress(BOOL bOnlyFormat)
 				nb_slots[OP_FILE_COPY] = 5 + 1;
 				break;
 			case BT_IMAGE:
-				nb_slots[OP_FILE_COPY] = img_report.is_iso ? -1 : 0;
+				nb_slots[OP_FILE_COPY] = (img_report.is_iso || img_report.is_windows_img) ? -1 : 0;
 				break;
 			default:
 				nb_slots[OP_FILE_COPY] = 2 + 1;
 				break;
 			}
 		}
-		if (selection_default == BT_IMAGE && !img_report.is_iso) {
+		if (selection_default == BT_IMAGE && !(img_report.is_iso || img_report.is_windows_img)) {
 			nb_slots[OP_FORMAT] = -1;
 		} else {
 			nb_slots[OP_ZERO_MBR] = 1;
 			nb_slots[OP_PARTITION] = 1;
 			nb_slots[OP_FIX_MBR] = 1;
 			nb_slots[OP_CREATE_FS] = (use_vds) ? 2 :
-				nb_steps[ComboBox_GetItemData(hFileSystem, ComboBox_GetCurSel(hFileSystem))];
+				nb_steps[ComboBox_GetCurItemData(hFileSystem)];
 			// So, yeah, if you're doing slow format, or using Large FAT32, and have persistence, you'll see
 			// the progress bar revert during format on account that we reuse the same operation for both
 			// partitions. Maybe one day I'll be bothered to handle two separate OP_FORMAT ops...
